@@ -1,5 +1,8 @@
 /* ---------------------------------------------------------------
    Item definitions
+   kind: 'gate' (pass/fail, gates the whole scenario), 'scale' (manual
+   1-3 judgment), 'percent' (a real measured 0-100 value, either
+   computed automatically or entered directly — no lossy 1-3 bucket)
 --------------------------------------------------------------- */
 const ITEMS_C0 = [
   {id:'sync_chirp', label:'Sync Chirp', priority:'P0', kind:'gate', help:'Audible chirp detected and aligned across camera + ambient mic.'},
@@ -8,20 +11,22 @@ const ITEMS_C0 = [
   {id:'translation', label:'Translation Movements', priority:'P0', kind:'scale', help:'Near/far translation movements in the ~25–30s window.'},
   {id:'static_end', label:'Static Before End', priority:'P0', kind:'scale', help:'Held still again before the capture ends.'},
 ];
+// Useful Views is no longer a scored/averaged item here — it's the room-level
+// "at least MIN_GOOD_EPISODES passed episodes" gate instead (see computeRoomGate).
 const ITEMS_TECHNICAL = [
   {id:'device_placements', label:'Device Placements', priority:'P0', kind:'scale', help:'At least 6 distinct camera positions covered in this room.'},
-  {id:'useful_views', label:'Useful Views', priority:'P0', kind:'scale', help:'Count of retained/usable views for this room.'},
   {id:'audio_quality', label:'Audio Quality', priority:'P1', kind:'scale', help:'Clipping, noise floor, intelligibility.'},
   {id:'video_quality', label:'Video Quality', priority:'P1', kind:'scale', help:'Exposure, focus, framing, dropped frames.'},
 ];
 const ITEMS_PARTICIPANT = [
   {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'scale', help:'Performer in continuous motion for >75% of the episode.'},
-  {id:'blue_zone', label:'Blue Zone %', priority:'P1', kind:'scale', help:'Time spent inside the 120°×5m forward FOV. Use the live overlay as a guide.'},
+  {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', help:'Time spent inside the 120°×5m forward FOV — measured directly from the video detector when available.'},
   {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'scale', help:'Brief exits/re-entries outside FOV, staying near 2m, turning back before 3m.'},
   {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'scale', help:'Natural variation in movement speed.'},
   {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'scale', help:'Natural variation in near/far distance.'},
 ];
 const SCENARIO_ORDER = ['C0','T1-R1','T1-R2','T1-R3'];
+const MIN_GOOD_EPISODES = 10; // client threshold: a room needs at least this many PASSED episodes
 
 /* ---------------------------------------------------------------
    Ingested session state
@@ -33,14 +38,17 @@ let ingested = {
 };
 let currentScenarioId = null;
 let currentEpisodeId = null;
+let currentScope = 'technical'; // 'technical' | 'participant' — only meaningful for T1 scenarios
 let formCache = {};
 let localScores = {};
 let dbNS = null, downloadsNS = null;
-let videoEl = null; // live reference to the <video> element, persists across episode changes
+let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
 
 function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function logLine(html){ const el = document.getElementById('loadLog'); const d = document.createElement('div'); d.innerHTML = html; el.appendChild(d); el.scrollTop = el.scrollHeight; }
 function deriveCaptureIdFromName(name){ const m = /_c(\d{3,})[._]/.exec(name || ''); return m ? 'c' + m[1] : null; }
+function fmtSec(ms){ return ms == null ? '—' : (ms/1000).toFixed(1) + 's'; }
+function fmtPct(v){ return v == null ? '—' : v.toFixed(0) + '%'; }
 
 /* ---------------------------------------------------------------
    File classification + ingestion
@@ -174,6 +182,7 @@ async function handleFiles(fileList){
   }
   renderScenarioTabs();
   renderScenarioShell();
+  renderSessionBanner();
 }
 
 function refreshSessionStatus(){
@@ -187,7 +196,8 @@ function refreshSessionStatus(){
 /* ---------------------------------------------------------------
    Automated value suggestions
 --------------------------------------------------------------- */
-function computeAutos(scenarioId, items){
+// Scenario-scoped autos: Sync Chirp (C0), Audio/Video Quality (T1 Technical)
+function computeScenarioAutos(scenarioId, items){
   const scenario = ingested.scenarios[scenarioId];
   const captureId = scenario && scenario.captureId;
   const ev = captureId ? ingested.evidenceByCapture[captureId] : null;
@@ -204,12 +214,6 @@ function computeAutos(scenarioId, items){
       autos.sync_chirp.note = roles.map(r => `${r}: ${ev.sync[r] || 'n/a'}`).join(' · ');
     } else { autos.sync_chirp.note = 'No session_evidence loaded for this capture.'; }
   }
-  if (autos.useful_views){
-    const episodes = captureId ? ingested.episodesByCapture[captureId] : null;
-    const n = episodes ? episodes.filter(e => e.disposition === 'retained').length : null;
-    if (n != null && n > 0){ autos.useful_views.value = n < 10 ? 1 : (n <= 12 ? 2 : 3); autos.useful_views.note = `${n} retained episodes (of ${episodes.length})`; }
-    else { autos.useful_views.note = 'No episode_markers loaded for this capture yet.'; }
-  }
   ['audio_quality','video_quality'].forEach(id => {
     if (!autos[id]) return;
     if (val && val.issues){
@@ -224,6 +228,34 @@ function computeAutos(scenarioId, items){
     } else { autos[id].note = 'No session_validation loaded for this capture.'; }
   });
   return autos;
+}
+
+// Episode-scoped auto: Blue Zone % computed from the video-zone log, filtered
+// to this specific episode's time window. Also returns a coverage figure
+// (fraction of sampled frames that actually had a detection) so the reviewer
+// can see how much to trust the number, not just the number itself.
+function computeBlueZoneAuto(scenarioId, episode){
+  const scenario = ingested.scenarios[scenarioId];
+  const captureId = scenario && scenario.captureId;
+  const videoZone = captureId ? ingested.videoZoneByCapture[captureId] : null;
+  if (!videoZone || !episode || episode.startElapsedMs == null || episode.durationMs == null){
+    return {value: null, note: 'No video-zone log loaded for this capture.', coveragePct: null};
+  }
+  const startSec = episode.startElapsedMs / 1000;
+  const endSec = (episode.startElapsedMs + episode.durationMs) / 1000;
+  const inWindow = videoZone.filter(f => f.time_s >= startSec && f.time_s <= endSec);
+  if (!inWindow.length) return {value: null, note: 'No video-zone samples fall inside this episode\'s time window.', coveragePct: null};
+  const detected = inWindow.filter(f => f.azimuth_deg != null);
+  const inBlue = detected.filter(f => f.in_blue_zone);
+  const coveragePct = detected.length / inWindow.length * 100;
+  const bluePct = detected.length ? (inBlue.length / detected.length * 100) : null;
+  return {
+    value: bluePct != null ? Math.round(bluePct * 10) / 10 : null,
+    note: bluePct != null
+      ? `${inWindow.length} samples in window, detected in ${coveragePct.toFixed(0)}%`
+      : 'No detections landed inside this episode\'s window.',
+    coveragePct,
+  };
 }
 
 /* ---------------------------------------------------------------
@@ -251,18 +283,29 @@ async function queryAll(){
 
 /* ---------------------------------------------------------------
    Scoring
+   Every item, regardless of kind, is converted to a 0-100 "percent
+   of max" figure before pooling — scale items via value/3*100,
+   percent items pass through as-is. This lets a measured percentage
+   (Blue Zone) sit in the same average as a manual 1-3 judgment
+   without forcing the measurement through a lossy bucket first.
 --------------------------------------------------------------- */
+function toPct(it, v){
+  if (v == null) return null;
+  return it.kind === 'percent' ? v : (v / 3 * 100);
+}
+
 function computeScores(items, values){
   let gateFailed = false; const p0 = [], p1 = [];
   items.forEach(it => {
     const v = values[it.id];
     if (it.kind === 'gate'){ if (v === 'fail') gateFailed = true; }
-    else if (v != null){ (it.priority === 'P0' ? p0 : p1).push(v); }
+    else {
+      const pct = toPct(it, v);
+      if (pct != null) (it.priority === 'P0' ? p0 : p1).push(pct);
+    }
   });
   const avg = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
-  const p0Avg = avg(p0), p1Avg = avg(p1);
-  const p0Pct = p0Avg != null ? p0Avg/3*100 : null;
-  const p1Pct = p1Avg != null ? p1Avg/3*100 : null;
+  const p0Pct = avg(p0), p1Pct = avg(p1);
   let overall = 'incomplete';
   if (gateFailed) overall = 'fail';
   else if (p0Pct != null || p1Pct != null){
@@ -272,23 +315,81 @@ function computeScores(items, values){
   return {p0Pct, p1Pct, gateFailed, overall};
 }
 
-function combinedT1Score(technicalValues, participantDocs){
-  const p0vals = [technicalValues.device_placements, technicalValues.useful_views].filter(v => v != null);
-  const p1vals = [technicalValues.audio_quality, technicalValues.video_quality].filter(v => v != null);
-  const avgOf = key => { const nums = participantDocs.map(d => d.scores && d.scores[key]).filter(v => v != null); return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null; };
-  const cm = avgOf('continuous_movement'); if (cm != null) p0vals.push(cm);
-  ['blue_zone','orange_zone','speed_variance','distance_variance'].forEach(k => { const a = avgOf(k); if (a != null) p1vals.push(a); });
+// Room-level BLENDED REPORTING numbers only (technical + averaged participant
+// items) — a smooth quality figure. This never decides pass/fail on its own;
+// see computeRoomGate for the actual gate, which uses hard counts instead of
+// an average so one bad episode can't hide inside a good-looking mean.
+function blendedRoomQuality(technicalValues, participantDocs){
+  const p0vals = []; const p1vals = [];
+  ITEMS_TECHNICAL.forEach(it => { const pct = toPct(it, technicalValues[it.id]); if (pct != null) (it.priority==='P0'?p0vals:p1vals).push(pct); });
+  const avgOf = key => {
+    const nums = participantDocs.map(d => d.scores && d.scores[key]).filter(v => v != null);
+    return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null;
+  };
+  ITEMS_PARTICIPANT.forEach(it => {
+    const raw = avgOf(it.id);
+    if (raw != null) (it.priority==='P0'?p0vals:p1vals).push(it.kind==='percent' ? raw : raw/3*100);
+  });
   const avg = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
-  const p0Avg = avg(p0vals), p1Avg = avg(p1vals);
-  const p0Pct = p0Avg != null ? p0Avg/3*100 : null;
-  const p1Pct = p1Avg != null ? p1Avg/3*100 : null;
-  const p0ok = p0Pct == null || p0Pct >= 85; const p1ok = p1Pct == null || p1Pct >= 75;
-  const overall = (p0Pct == null && p1Pct == null) ? 'incomplete' : ((p0ok && p1ok) ? 'pass' : 'fail');
-  return {p0Pct, p1Pct, overall, scoredEpisodes: participantDocs.length};
+  return {p0Pct: avg(p0vals), p1Pct: avg(p1vals)};
+}
+
+// The actual room-level GATE: technical thresholds AND at least
+// MIN_GOOD_EPISODES individually-passed episodes. gatePass is null
+// (not true/false) when there isn't enough data yet to judge.
+async function computeRoomGate(scenarioId){
+  const scenario = ingested.scenarios[scenarioId];
+  if (!scenario) return null;
+  const techDocId = `${ingested.sessionId}__${scenarioId}__technical`;
+  const techSaved = await loadDoc(techDocId);
+  const techValues = (techSaved && techSaved.scores) || {};
+  const techScores = computeScores(ITEMS_TECHNICAL, techValues);
+  const allDocs = await queryAll();
+  const participantDocs = allDocs.filter(d => d.scenarioId === scenarioId && d.kind === 'participant');
+  const episodes = ingested.episodesByCapture[scenario.captureId] || [];
+  const retainedCount = episodes.filter(e => e.disposition === 'retained').length;
+  const passedCount = participantDocs.filter(d => d.overall === 'pass').length;
+  const meetsMinimum = passedCount >= MIN_GOOD_EPISODES;
+  const technicalOk = !techScores.gateFailed && (techScores.p0Pct == null || techScores.p0Pct >= 85) && (techScores.p1Pct == null || techScores.p1Pct >= 75);
+  const hasAnyData = !!techSaved || participantDocs.length > 0;
+  const blended = blendedRoomQuality(techValues, participantDocs);
+  return {
+    scenarioId, roomLabel: scenario.roomLabel,
+    retainedCount, episodesTotal: episodes.length, passedCount, meetsMinimum,
+    technicalOk, technicalP0Pct: techScores.p0Pct, technicalP1Pct: techScores.p1Pct,
+    blendedP0Pct: blended.p0Pct, blendedP1Pct: blended.p1Pct,
+    gatePass: hasAnyData ? (technicalOk && meetsMinimum) : null,
+  };
+}
+
+async function computeC0Gate(){
+  if (!ingested.sessionId) return null;
+  const saved = await loadDoc(`${ingested.sessionId}__C0__form`);
+  if (!saved) return {gatePass: null, p0Pct: null};
+  const scores = computeScores(ITEMS_C0, saved.scores || {});
+  const gatePass = !scores.gateFailed && (scores.p0Pct == null ? null : scores.p0Pct >= 85);
+  return {gatePass, p0Pct: scores.p0Pct, gateFailed: scores.gateFailed};
+}
+
+async function computeSessionSummary(){
+  if (!ingested.sessionId) return null;
+  const c0 = await computeC0Gate();
+  const rooms = await Promise.all(['T1-R1','T1-R2','T1-R3'].map(computeRoomGate));
+  const all = [c0, ...rooms];
+  const anyLoaded = ingested.sessionId && SCENARIO_ORDER.some(id => ingested.scenarios[id]);
+  if (!anyLoaded) return null;
+  const gates = [c0 ? c0.gatePass : null, ...rooms.map(r => r ? r.gatePass : null)];
+  let sessionPass = 'incomplete';
+  if (gates.some(g => g === false)) sessionPass = 'fail';
+  else if (gates.every(g => g === true)) sessionPass = 'pass';
+  const avgOf = arr => { const nums = arr.filter(v => v != null); return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null; };
+  const sessionP0 = avgOf([c0 ? c0.p0Pct : null, ...rooms.map(r => r ? r.blendedP0Pct : null)]);
+  const sessionP1 = avgOf(rooms.map(r => r ? r.blendedP1Pct : null)); // C0 has no P1 pool
+  return {sessionPass, sessionP0, sessionP1, c0, rooms};
 }
 
 /* ---------------------------------------------------------------
-   Zone classification (mmWave track -> Blue/Orange/warning)
+   Zone classification
 --------------------------------------------------------------- */
 function classifyZone(track){
   if (!track || track.rangeM == null || track.azimuthDeg == null) return {label: 'No lock', cls: 'muted'};
@@ -304,7 +405,6 @@ function classifyZoneVideo(sample){
   return sample.in_blue_zone ? {label: 'Blue zone', cls: 'blue'} : {label: 'Outside blue zone', cls: 'warn'};
 }
 function nearestTrackFrame(frames, targetSec){
-  // frames sorted ascending by videoTimeSec (attached below)
   let lo = 0, hi = frames.length - 1;
   if (!frames.length) return null;
   while (lo < hi){
@@ -334,16 +434,42 @@ function renderScenarioTabs(){
     return `<button class="${active}" data-scenario="${id}" ${disabled}>${id}${s ? `<span class="room">${escapeHtml(s.roomLabel)}</span>${flags}` : ''}</button>`;
   }).join('');
   el.querySelectorAll('button').forEach(btn => {
-    btn.addEventListener('click', () => { currentScenarioId = btn.dataset.scenario; currentEpisodeId = null; renderScenarioTabs(); renderScenarioShell(); });
+    btn.addEventListener('click', () => {
+      currentScenarioId = btn.dataset.scenario; currentEpisodeId = null; currentScope = 'technical';
+      renderScenarioTabs(); renderScenarioShell();
+    });
   });
 }
 
+/* ---------------------------------------------------------------
+   Rendering: session banner (always visible, scope = SESSION)
+--------------------------------------------------------------- */
+async function renderSessionBanner(){
+  const el = document.getElementById('sessionBanner');
+  const summary = await computeSessionSummary();
+  if (!summary){ el.innerHTML = ''; return; }
+  const pillsHtml = [['C0', summary.c0], ['T1-R1', summary.rooms[0]], ['T1-R2', summary.rooms[1]], ['T1-R3', summary.rooms[2]]]
+    .map(([label, g]) => {
+      const state = !g ? 'incomplete' : (g.gatePass === true ? 'pass' : g.gatePass === false ? 'fail' : 'incomplete');
+      return `<span class="gate-pill ${state}">${label}</span>`;
+    }).join('');
+  el.innerHTML = `
+    <div class="scope-badge session">SESSION</div>
+    <div class="session-banner-row">
+      <div class="gate-pills">${pillsHtml}</div>
+      <div class="session-nums">P0 avg ${fmtPct(summary.sessionP0)} · P1 avg ${fmtPct(summary.sessionP1)}</div>
+      <div class="overall-badge ${summary.sessionPass}">${summary.sessionPass.toUpperCase()}</div>
+    </div>`;
+}
+
+/* ---------------------------------------------------------------
+   Shared rendering helpers
+--------------------------------------------------------------- */
 function scoreSummaryHtml(p0Pct, p1Pct, overall, label){
-  const pct = v => v == null ? '—' : v.toFixed(0) + '%';
   const w = v => v == null ? 0 : Math.max(0, Math.min(100, v));
   return `<div class="score-summary">
-    <div class="score-metric"><div class="label">P0 (need ≥85%)</div><div class="value">${pct(p0Pct)}</div><div class="bar"><div style="width:${w(p0Pct)}%"></div></div></div>
-    <div class="score-metric"><div class="label">P1 (need ≥75%)</div><div class="value">${pct(p1Pct)}</div><div class="bar"><div style="width:${w(p1Pct)}%"></div></div></div>
+    <div class="score-metric"><div class="label">P0 (need ≥85%)</div><div class="value">${fmtPct(p0Pct)}</div><div class="bar"><div style="width:${w(p0Pct)}%"></div></div></div>
+    <div class="score-metric"><div class="label">P1 (need ≥75%)</div><div class="value">${fmtPct(p1Pct)}</div><div class="bar"><div style="width:${w(p1Pct)}%"></div></div></div>
     <div class="overall-badge ${overall}">${label || overall.toUpperCase()}</div>
   </div>`;
 }
@@ -351,9 +477,12 @@ function scoreSummaryHtml(p0Pct, p1Pct, overall, label){
 function itemRowHtml(it, value, auto){
   const autoBadge = (auto && auto.value != null) ? `<span class="badge auto">auto-suggested</span>` : '';
   const noteHtml = (auto && auto.note) ? `<div class="item-note">${escapeHtml(auto.note)}</div>` : '';
+  const coverageHtml = (auto && auto.coveragePct != null) ? `<div class="item-note">detector confidence: ${auto.coveragePct.toFixed(0)}% of frames had a detection</div>` : '';
   let control;
   if (it.kind === 'gate'){
     control = ['pass','fail'].map(v => `<button type="button" class="seg ${value===v?'active '+v:''}" data-item="${it.id}" data-value="${v}">${v==='pass'?'Pass':'Fail'}</button>`).join('');
+  } else if (it.kind === 'percent'){
+    control = `<div class="percent-input"><input type="number" min="0" max="100" step="0.1" data-item="${it.id}" value="${value != null ? value : ''}" placeholder="0-100"><span>%</span></div>`;
   } else {
     control = [1,2,3].map(n => `<button type="button" class="seg ${value===n?'active':''}" data-item="${it.id}" data-value="${n}">${n}</button>`).join('');
   }
@@ -361,14 +490,13 @@ function itemRowHtml(it, value, auto){
     <div class="item-label"><span class="pri ${it.priority}">${it.priority}</span> ${escapeHtml(it.label)} ${autoBadge}</div>
     <div class="item-desc">${escapeHtml(it.help)}</div>
     <div class="seg-group">${control}</div>
-    ${noteHtml}
+    ${noteHtml}${coverageHtml}
   </div>`;
 }
 
-async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId){
+async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId, autos){
   if (formCache[docId]) return formCache[docId];
   const saved = await loadDoc(docId);
-  const autos = computeAutos(scenarioId, items);
   const values = {};
   items.forEach(it => {
     if (saved && saved.scores && saved.scores[it.id] != null) values[it.id] = saved.scores[it.id];
@@ -379,19 +507,16 @@ async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId){
   return formCache[docId];
 }
 
-function fmtSec(ms){ return ms == null ? '—' : (ms/1000).toFixed(1) + 's'; }
-
 /* ---------------------------------------------------------------
-   Rendering: scenario shell (video + episode selector + zone overlay)
-   Rebuilt only on scenario change, so the <video> element is not
-   recreated on episode switches or score saves.
+   Rendering: scenario shell (video + zone overlay + episode selector
+   + scope sub-tabs). Rebuilt only on scenario change, so the <video>
+   element is never recreated on episode/scope switches or saves.
 --------------------------------------------------------------- */
 async function renderScenarioShell(){
   const shell = document.getElementById('scenarioShell');
   videoEl = null;
   if (!currentScenarioId || !ingested.scenarios[currentScenarioId]){
     shell.innerHTML = `<div class="empty-state">Choose a scenario on the left to begin scoring.</div>`;
-    document.getElementById('scoringSection').innerHTML = '';
     return;
   }
   const scenario = ingested.scenarios[currentScenarioId];
@@ -401,7 +526,8 @@ async function renderScenarioShell(){
   const audit = ingested.auditByScenario[currentScenarioId];
   const tracks = ingested.tracksByCapture[scenario.captureId];
   const videoZone = ingested.videoZoneByCapture[scenario.captureId];
-  const zoneSource = videoZone ? 'video' : (tracks ? 'mmwave' : null); // video-based zone wins when both are present
+  const zoneSource = videoZone ? 'video' : (tracks ? 'mmwave' : null);
+  const isC0 = currentScenarioId === 'C0';
 
   const auditLine = audit ? `<div class="audit-line">Devices required: ${escapeHtml(audit.expectedDevices.join(', '))}</div>` : '';
   const videoHtml = video
@@ -429,21 +555,36 @@ async function renderScenarioShell(){
       <span class="episode-info" id="episodeInfo"></span>
     </div>` : `<div class="episode-info">No episode_markers loaded for this room.</div>`;
 
+  const scopeTabsHtml = !isC0 ? `
+    <div class="scope-tabs">
+      <button class="${currentScope==='technical'?'active':''}" data-scope="technical">Technical <span class="scope-badge room">ROOM-LEVEL</span></button>
+      <button class="${currentScope==='participant'?'active':''}" data-scope="participant">Participant <span class="scope-badge episode">EPISODE-LEVEL</span></button>
+    </div>` : `<div class="scope-tabs"><span class="scope-badge calibration">CALIBRATION (C0)</span></div>`;
+
   shell.innerHTML = `
     <div class="scenario-header">
       <div><h2>${escapeHtml(currentScenarioId)} — ${escapeHtml(scenario.roomLabel)}</h2>
       <div class="meta">${escapeHtml(scenario.captureId)}${episodes.length?` · ${episodes.filter(e=>e.disposition==='retained').length}/${episodes.length} retained episodes`:''}</div>
       ${auditLine}</div>
     </div>
-    <div class="video-row">
-      <div>${videoHtml}${episodeSelectHtml}</div>
-      ${zoneHtml}
+    ${scopeTabsHtml}
+    <div class="workspace">
+      <div class="video-col">
+        ${videoHtml}
+        ${zoneHtml}
+        ${episodeSelectHtml}
+      </div>
+      <div class="score-col" id="scoringSection"></div>
     </div>`;
 
   videoEl = document.getElementById('capVideo');
   const epSelect = document.getElementById('episodeSelect');
   const seekBtn = document.getElementById('seekBtn');
   const episodeInfo = document.getElementById('episodeInfo');
+
+  shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(btn => {
+    btn.addEventListener('click', () => { currentScope = btn.dataset.scope; shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(b=>b.classList.toggle('active', b===btn)); renderScoringSection(); });
+  });
 
   function updateEpisodeInfo(){
     const ep = episodes.find(e => e.episodeId === currentEpisodeId);
@@ -459,13 +600,12 @@ async function renderScenarioShell(){
     if (ep && ep.startElapsedMs != null && videoEl) videoEl.currentTime = ep.startElapsedMs / 1000;
   });
 
-  // Wire zone overlay (independent of scoring re-renders — never rebuild videoEl after this)
   if (zoneSource === 'video' && video && videoEl){
     const frames = videoZone.map(f => ({ ...f, __t: f.time_s })).sort((a,b) => a.__t - b.__t);
     let lastUpdate = 0;
     videoEl.addEventListener('timeupdate', () => {
       const now = performance.now();
-      if (now - lastUpdate < 200) return; // throttle to ~5/sec
+      if (now - lastUpdate < 200) return;
       lastUpdate = now;
       const sample = nearestTrackFrame(frames, videoEl.currentTime);
       const zone = classifyZoneVideo(sample);
@@ -475,7 +615,6 @@ async function renderScenarioShell(){
       if (badge){ badge.className = 'zone-badge ' + zone.cls; badge.textContent = zone.label; }
       if (readout) readout.textContent = (sample && sample.azimuth_deg != null) ? `${sample.azimuth_deg.toFixed(0)}°${sample.score!=null?` (score ${sample.score.toFixed(2)})`:''}` : '–';
       if (dot && sample && sample.azimuth_deg != null){
-        // simple angle-only indicator: place the dot on a fixed-radius arc at the detected azimuth (no range available from video)
         const rad = sample.azimuth_deg * Math.PI / 180;
         const cx = 80 + 55 * Math.sin(rad);
         const cy = 110 - 55 * Math.cos(rad);
@@ -490,7 +629,7 @@ async function renderScenarioShell(){
     let lastUpdate = 0;
     videoEl.addEventListener('timeupdate', () => {
       const now = performance.now();
-      if (now - lastUpdate < 200) return; // throttle to ~5/sec
+      if (now - lastUpdate < 200) return;
       lastUpdate = now;
       const frame = nearestTrackFrame(frames, videoEl.currentTime);
       const track = frame ? frame.activeTrack : null;
@@ -513,17 +652,19 @@ async function renderScenarioShell(){
 }
 
 /* ---------------------------------------------------------------
-   Rendering: scoring section (rebuilt on scenario AND episode change,
-   and after each save — never touches the video element)
+   Rendering: scoring section (right column). Rebuilt on scenario,
+   scope, and episode change, and after each save — never touches
+   the video element.
 --------------------------------------------------------------- */
 async function renderScoringSection(){
   const el = document.getElementById('scoringSection');
-  if (!currentScenarioId || !ingested.scenarios[currentScenarioId]){ el.innerHTML = ''; return; }
+  if (!el || !currentScenarioId || !ingested.scenarios[currentScenarioId]) return;
   const scenario = ingested.scenarios[currentScenarioId];
 
   if (currentScenarioId === 'C0'){
     const docId = `${ingested.sessionId}__C0__form`;
-    const form = await ensureFormLoaded(docId, ITEMS_C0, 'c0', 'C0', null);
+    const autos = computeScenarioAutos('C0', ITEMS_C0);
+    const form = await ensureFormLoaded(docId, ITEMS_C0, 'c0', 'C0', null, autos);
     const scores = computeScores(ITEMS_C0, form.values);
     el.innerHTML = `
       ${scoreSummaryHtml(scores.p0Pct, null, scores.overall, scores.gateFailed ? 'FAIL — sync chirp' : undefined)}
@@ -536,58 +677,64 @@ async function renderScoringSection(){
           <span class="saved-at" id="savedAtLabel">${form.savedAt ? 'Saved ' + new Date(form.savedAt).toLocaleString() : 'Not saved yet'}</span>
         </div>
       </div>`;
-    wireItemClicks('c0Items', docId);
-    wireSaveButton(docId, ITEMS_C0, 'c0', 'C0', null, 'saveBtn', 'savedAtLabel');
+    wireItemInputs('c0Items', docId);
+    wireSaveButton(docId, ITEMS_C0, 'c0', 'C0', null, 'saveBtn');
     return;
   }
 
-  const techDocId = `${ingested.sessionId}__${currentScenarioId}__technical`;
-  const techForm = await ensureFormLoaded(techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null);
   const episodes = ingested.episodesByCapture[scenario.captureId] || [];
-  const allDocs = await queryAll();
-  const participantDocs = allDocs.filter(d => d.scenarioId === currentScenarioId && d.kind === 'participant');
-  const rollup = combinedT1Score(techForm.values, participantDocs);
 
-  let episodeSectionHtml = `<div class="empty-state">No episode_markers loaded for this room yet.</div>`;
-  let participantForm = null, epDocId = null;
-  if (episodes.length && currentEpisodeId){
-    epDocId = `${ingested.sessionId}__${currentScenarioId}__ep__${currentEpisodeId}`;
-    participantForm = await ensureFormLoaded(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId);
-    const epScores = computeScores(ITEMS_PARTICIPANT, participantForm.values);
-    episodeSectionHtml = `
-      ${scoreSummaryHtml(epScores.p0Pct, epScores.p1Pct, epScores.overall)}
-      <div id="participantItems">${ITEMS_PARTICIPANT.map(it => itemRowHtml(it, participantForm.values[it.id], null)).join('')}</div>
+  if (currentScope === 'technical'){
+    const techDocId = `${ingested.sessionId}__${currentScenarioId}__technical`;
+    const autos = computeScenarioAutos(currentScenarioId, ITEMS_TECHNICAL);
+    const techForm = await ensureFormLoaded(techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null, autos);
+    const gate = await computeRoomGate(currentScenarioId);
+    el.innerHTML = `
+      ${scoreSummaryHtml(gate.technicalP0Pct, gate.technicalP1Pct, gate.gatePass===true?'pass':gate.gatePass===false?'fail':'incomplete', gate.gatePass===true?'ROOM PASS':gate.gatePass===false?'ROOM FAIL':'INCOMPLETE')}
+      <div class="panel">
+        <div class="gate-stat ${gate.meetsMinimum?'ok':'bad'}">
+          <b>${gate.passedCount}</b> of <b>${MIN_GOOD_EPISODES}</b> required good episodes passed
+          <span class="gate-stat-sub">(${gate.retainedCount}/${gate.episodesTotal} episodes retained)</span>
+        </div>
+        <div class="section-title">Technical checklist <span class="count">room-level · P0 &amp; P1</span></div>
+        <div id="techItems">${ITEMS_TECHNICAL.map(it => itemRowHtml(it, techForm.values[it.id], techForm.autos[it.id])).join('')}</div>
+        <div class="save-row">
+          <button class="btn primary" id="saveTechBtn">Save technical score</button>
+          <span class="saved-at" id="techSavedAtLabel">${techForm.savedAt ? 'Saved ' + new Date(techForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
+        </div>
+      </div>`;
+    wireItemInputs('techItems', techDocId);
+    wireSaveButton(techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null, 'saveTechBtn');
+    return;
+  }
+
+  // Participant scope
+  if (!episodes.length || !currentEpisodeId){
+    el.innerHTML = `<div class="empty-state">No episode_markers loaded for this room yet.</div>`;
+    return;
+  }
+  const ep = episodes.find(e => e.episodeId === currentEpisodeId);
+  const epDocId = `${ingested.sessionId}__${currentScenarioId}__ep__${currentEpisodeId}`;
+  const blueAuto = computeBlueZoneAuto(currentScenarioId, ep);
+  const autos = { blue_zone_pct: blueAuto };
+  const participantForm = await ensureFormLoaded(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, autos);
+  const epScores = computeScores(ITEMS_PARTICIPANT, participantForm.values);
+  el.innerHTML = `
+    ${scoreSummaryHtml(epScores.p0Pct, epScores.p1Pct, epScores.overall)}
+    <div class="panel">
+      <div class="section-title">Participant checklist <span class="count">this episode</span></div>
+      <div id="participantItems">${ITEMS_PARTICIPANT.map(it => itemRowHtml(it, participantForm.values[it.id], participantForm.autos[it.id])).join('')}</div>
       <div class="notes-block"><label>Reviewer notes (this episode)</label><textarea id="epNotesField">${escapeHtml(participantForm.notes)}</textarea></div>
       <div class="save-row">
         <button class="btn primary" id="saveEpBtn">Save episode score</button>
         <span class="saved-at" id="epSavedAtLabel">${participantForm.savedAt ? 'Saved ' + new Date(participantForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
-      </div>`;
-  }
-
-  el.innerHTML = `
-    ${scoreSummaryHtml(rollup.p0Pct, rollup.p1Pct, rollup.overall, `${rollup.overall.toUpperCase()} · ${rollup.scoredEpisodes}/${episodes.length||'?'} episodes scored`)}
-    <div class="panel">
-      <div class="section-title">Technical <span class="count">room-level · P0 &amp; P1</span></div>
-      <div id="techItems">${ITEMS_TECHNICAL.map(it => itemRowHtml(it, techForm.values[it.id], techForm.autos[it.id])).join('')}</div>
-      <div class="save-row">
-        <button class="btn primary" id="saveTechBtn">Save technical score</button>
-        <span class="saved-at" id="techSavedAtLabel">${techForm.savedAt ? 'Saved ' + new Date(techForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
       </div>
-    </div>
-    <div class="panel">
-      <div class="section-title">Participant <span class="count">per episode</span></div>
-      ${episodeSectionHtml}
     </div>`;
-
-  wireItemClicks('techItems', techDocId);
-  wireSaveButton(techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null, 'saveTechBtn', 'techSavedAtLabel');
-  if (participantForm){
-    wireItemClicks('participantItems', epDocId);
-    wireSaveButton(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, 'saveEpBtn', 'epSavedAtLabel');
-  }
+  wireItemInputs('participantItems', epDocId);
+  wireSaveButton(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, 'saveEpBtn');
 }
 
-function wireItemClicks(containerId, docId){
+function wireItemInputs(containerId, docId){
   const container = document.getElementById(containerId);
   if (!container) return;
   container.querySelectorAll('.seg').forEach(btn => {
@@ -600,9 +747,19 @@ function wireItemClicks(containerId, docId){
       renderScoringSection();
     });
   });
+  container.querySelectorAll('input[type="number"][data-item]').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const itemId = inp.dataset.item;
+      if (!formCache[docId]) return;
+      let v = inp.value === '' ? null : parseFloat(inp.value);
+      if (v != null) v = Math.max(0, Math.min(100, v));
+      formCache[docId].values[itemId] = v;
+      renderScoringSection();
+    });
+  });
 }
 
-function wireSaveButton(docId, items, kind, scenarioId, episodeId, btnId, labelId){
+function wireSaveButton(docId, items, kind, scenarioId, episodeId, btnId){
   const btn = document.getElementById(btnId);
   if (!btn) return;
   btn.addEventListener('click', async () => {
@@ -622,6 +779,7 @@ function wireSaveButton(docId, items, kind, scenarioId, episodeId, btnId, labelI
     form.savedAt = payload.savedAt;
     renderSavedList();
     renderScoringSection();
+    renderSessionBanner();
   });
 }
 
@@ -650,7 +808,7 @@ fileInput.addEventListener('change', e => { if (e.target.files.length) handleFil
 ['dragleave','drop'].forEach(evt => dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
 dropzone.addEventListener('drop', e => { if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
 
-document.getElementById('refreshSavedBtn').addEventListener('click', renderSavedList);
+document.getElementById('refreshSavedBtn').addEventListener('click', () => { renderSavedList(); renderSessionBanner(); });
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const docs = await queryAll();
   const json = JSON.stringify(docs, null, 2);
@@ -663,4 +821,5 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
   await initCapabilities();
   renderScenarioTabs();
   renderSavedList();
+  renderSessionBanner();
 })();
