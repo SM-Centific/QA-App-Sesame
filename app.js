@@ -40,6 +40,7 @@ let currentScenarioId = null;
 let currentEpisodeId = null;
 let currentScope = 'technical'; // 'technical' | 'participant' — only meaningful for T1 scenarios
 let formCache = {};
+let annotationsCache = {}; // scenarioId -> array of {id, type, timeSec, text, createdAt}
 let localScores = {};
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
@@ -49,6 +50,79 @@ function logLine(html){ const el = document.getElementById('loadLog'); const d =
 function deriveCaptureIdFromName(name){ const m = /_c(\d{3,})[._]/.exec(name || ''); return m ? 'c' + m[1] : null; }
 function fmtSec(ms){ return ms == null ? '—' : (ms/1000).toFixed(1) + 's'; }
 function fmtPct(v){ return v == null ? '—' : v.toFixed(0) + '%'; }
+function fmtClock(sec){ sec = Math.max(0, Math.round(sec)); const m = Math.floor(sec/60), s = sec%60; return `${m}:${String(s).padStart(2,'0')}`; }
+
+/* ---------------------------------------------------------------
+   Video annotations — flags and timestamped comments on a capture's
+   video, stored per scenario (one video per room, spans all its
+   episodes) and exported alongside scores as their own sheet/table.
+--------------------------------------------------------------- */
+function annotationDocId(scenarioId){ return `${ingested.sessionId}__${scenarioId}__annotations`; }
+
+async function ensureAnnotationsLoaded(scenarioId){
+  if (annotationsCache[scenarioId]) return annotationsCache[scenarioId];
+  const saved = await loadDoc(annotationDocId(scenarioId));
+  annotationsCache[scenarioId] = (saved && saved.annotations) || [];
+  return annotationsCache[scenarioId];
+}
+
+async function persistAnnotations(scenarioId){
+  const scenario = ingested.scenarios[scenarioId];
+  await saveDoc(annotationDocId(scenarioId), {
+    sessionId: ingested.sessionId, scenarioId, kind: 'annotations',
+    roomLabel: (scenario || {}).roomLabel || null,
+    annotations: annotationsCache[scenarioId] || [],
+    savedAt: new Date().toISOString(),
+  });
+}
+
+async function addAnnotation(scenarioId, {type, timeSec, text}){
+  await ensureAnnotationsLoaded(scenarioId);
+  annotationsCache[scenarioId].push({
+    id: `${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+    type, timeSec, text, createdAt: new Date().toISOString(),
+  });
+  await persistAnnotations(scenarioId);
+}
+
+async function deleteAnnotation(scenarioId, id){
+  await ensureAnnotationsLoaded(scenarioId);
+  annotationsCache[scenarioId] = annotationsCache[scenarioId].filter(a => a.id !== id);
+  await persistAnnotations(scenarioId);
+}
+
+function findEpisodeNumberForTime(episodes, timeSec){
+  for (const ep of episodes){
+    if (ep.startElapsedMs == null || ep.durationMs == null) continue;
+    const start = ep.startElapsedMs / 1000, end = (ep.startElapsedMs + ep.durationMs) / 1000;
+    if (timeSec >= start && timeSec <= end) return ep.episodeNumber;
+  }
+  return null;
+}
+
+async function renderAnnotationsList(scenarioId, episodes){
+  const listEl = document.getElementById('annotationList');
+  const countEl = document.getElementById('annotationCount');
+  if (!listEl) return;
+  const anns = (await ensureAnnotationsLoaded(scenarioId)).slice().sort((a,b) => a.timeSec - b.timeSec);
+  if (countEl) countEl.textContent = anns.length ? `(${anns.length})` : '';
+  if (!anns.length){ listEl.innerHTML = `<div class="empty-state" style="padding:10px 4px;">No flags or comments yet.</div>`; return; }
+  listEl.innerHTML = anns.map(a => {
+    const epNum = findEpisodeNumberForTime(episodes, a.timeSec);
+    return `<div class="annotation-row ${a.type}">
+      <span class="a-time" data-seek="${a.timeSec}">${fmtClock(a.timeSec)}</span>
+      <span class="a-type">${a.type === 'flag' ? '⚑' : '💬'}</span>
+      <div class="a-body">${escapeHtml(a.text)}${epNum != null ? `<div class="a-ep">episode ${epNum}</div>` : ''}</div>
+      <button class="a-del" data-del="${a.id}" title="Delete">×</button>
+    </div>`;
+  }).join('');
+  listEl.querySelectorAll('[data-seek]').forEach(el => {
+    el.addEventListener('click', () => { if (videoEl) videoEl.currentTime = parseFloat(el.dataset.seek); });
+  });
+  listEl.querySelectorAll('[data-del]').forEach(el => {
+    el.addEventListener('click', async () => { await deleteAnnotation(scenarioId, el.dataset.del); renderAnnotationsList(scenarioId, episodes); });
+  });
+}
 
 /* ---------------------------------------------------------------
    File classification + ingestion
@@ -573,6 +647,15 @@ async function renderScenarioShell(){
         ${videoHtml}
         ${zoneHtml}
         ${episodeSelectHtml}
+        <div class="annotation-panel" id="annotationPanel">
+          <div class="panel-title">Video annotations <span id="annotationCount"></span></div>
+          <div class="annotation-add-row">
+            <button class="btn" id="addFlagBtn">⚑ Flag moment</button>
+            <button class="btn" id="addCommentBtn">💬 Add comment</button>
+          </div>
+          <div id="annotationFormHost"></div>
+          <div class="annotation-list" id="annotationList"></div>
+        </div>
       </div>
       <div class="score-col" id="scoringSection"></div>
     </div>`;
@@ -599,6 +682,38 @@ async function renderScenarioShell(){
     const ep = episodes.find(e => e.episodeId === currentEpisodeId);
     if (ep && ep.startElapsedMs != null && videoEl) videoEl.currentTime = ep.startElapsedMs / 1000;
   });
+
+  // Video annotations (flags + timestamped comments) — tied to the scenario's
+  // video as a whole, not to the currently-selected episode.
+  if (video && videoEl){
+    renderAnnotationsList(currentScenarioId, episodes);
+    function openAnnotationForm(type){
+      videoEl.pause();
+      const t = videoEl.currentTime;
+      const host = document.getElementById('annotationFormHost');
+      host.innerHTML = `
+        <div class="annotation-form">
+          <div class="time-label">${type === 'flag' ? '⚑ Flag' : '💬 Comment'} at ${fmtClock(t)}</div>
+          <textarea id="annotationText" placeholder="What did you notice?"></textarea>
+          <div class="form-row">
+            <button class="btn" id="annotationCancel">Cancel</button>
+            <button class="btn primary" id="annotationSave">Save</button>
+          </div>
+        </div>`;
+      document.getElementById('annotationCancel').addEventListener('click', () => { host.innerHTML = ''; });
+      document.getElementById('annotationSave').addEventListener('click', async () => {
+        const text = document.getElementById('annotationText').value.trim();
+        if (!text) return;
+        await addAnnotation(currentScenarioId, {type, timeSec: t, text});
+        host.innerHTML = '';
+        renderAnnotationsList(currentScenarioId, episodes);
+      });
+    }
+    const flagBtn = document.getElementById('addFlagBtn');
+    const commentBtn = document.getElementById('addCommentBtn');
+    if (flagBtn) flagBtn.addEventListener('click', () => openAnnotationForm('flag'));
+    if (commentBtn) commentBtn.addEventListener('click', () => openAnnotationForm('comment'));
+  }
 
   if (zoneSource === 'video' && video && videoEl){
     const frames = videoZone.map(f => ({ ...f, __t: f.time_s })).sort((a,b) => a.__t - b.__t);
@@ -785,7 +900,7 @@ function wireSaveButton(docId, items, kind, scenarioId, episodeId, btnId){
 
 async function renderSavedList(){
   const el = document.getElementById('savedList');
-  const docs = await queryAll();
+  const docs = (await queryAll()).filter(d => d.kind !== 'annotations');
   if (!docs.length){ el.innerHTML = `<div class="empty-state" style="padding:14px 4px;">Nothing saved yet.</div>`; return; }
   docs.sort((a,b) => (b.savedAt||'').localeCompare(a.savedAt||''));
   el.innerHTML = docs.map(d => {
