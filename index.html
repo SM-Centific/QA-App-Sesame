@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Capture QA Review — Trial v2</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <div>
+    <h1>Capture QA Review — Trial v2</h1>
+    <div class="sub">Upload session JSON + capture videos · scores episodes · live Blue/Orange zone overlay from mmWave tracks</div>
+  </div>
+  <div class="sub" id="persistStatus">Checking persistence…</div>
+</header>
+
+<div class="layout">
+  <div class="rail">
+    <div class="panel">
+      <h2>Load session files &amp; videos</h2>
+      <div class="dropzone" id="dropzone">
+        Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json,<br>mmwave tracks.jsonl, and capture video files here<br>— or click to browse
+        <input type="file" id="fileInput" multiple accept=".json,.jsonl,.mp4,.mov,.webm,video/*">
+      </div>
+      <div id="loadLog"></div>
+      <div class="status-line" id="sessionStatus">No files loaded yet.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Scenario</h2>
+      <div class="scenario-tabs" id="scenarioTabs"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Saved scores</h2>
+      <div id="savedList"><div class="empty-state" style="padding:14px 4px;">Nothing saved yet.</div></div>
+      <div class="save-row" style="margin-top:10px;">
+        <button class="btn" id="refreshSavedBtn">Refresh</button>
+        <button class="btn primary" id="exportBtn">Export all (.json)</button>
+      </div>
+      <textarea id="exportArea" style="display:none;margin-top:8px;" readonly></textarea>
+    </div>
+  </div>
+
+  <main>
+    <div id="scenarioShell"><div class="empty-state">Load session files, then choose a scenario to begin scoring.</div></div>
+    <div id="scoringSection"></div>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
