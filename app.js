@@ -334,25 +334,77 @@ function computeBlueZoneAuto(scenarioId, episode){
 
 /* ---------------------------------------------------------------
    Persistence
+   Three layers, tried in order: Claude's db capability (only present
+   when this runs inside a Claude artifact preview — never true on
+   GitHub Pages, kept only so the same code still works there too),
+   then localStorage (the real persistence on GitHub Pages — survives
+   reloads, scoped to this one browser/device), then an in-memory
+   object as a last-resort safety net if localStorage is unavailable
+   (private browsing, quota exceeded, etc).
+   This is a deliberate stand-in for the eventual SharePoint/Power
+   Automate backend — loadDoc/saveDoc/queryAll are the only three
+   functions that need to change when that's wired up; nothing else
+   in the app talks to storage directly.
 --------------------------------------------------------------- */
+const LS_PREFIX = 'qa_app_sesame::';
+let localStorageOk = false;
+
+function lsSet(docId, payload){
+  try { localStorage.setItem(LS_PREFIX + docId, JSON.stringify(payload)); return true; } catch(e){ return false; }
+}
+function lsGet(docId){
+  try { const raw = localStorage.getItem(LS_PREFIX + docId); return raw ? JSON.parse(raw) : null; } catch(e){ return null; }
+}
+function lsAll(){
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++){
+      const key = localStorage.key(i);
+      if (key && key.startsWith(LS_PREFIX)){
+        try { out.push(JSON.parse(localStorage.getItem(key))); } catch(e){}
+      }
+    }
+  } catch(e){}
+  return out;
+}
+
 async function initCapabilities(){
   try {
     if (window.claude && window.claude.use){ dbNS = await window.claude.use('db'); downloadsNS = await window.claude.use('downloads'); }
   } catch(e){ dbNS = null; downloadsNS = null; }
-  document.getElementById('persistStatus').textContent = dbNS ? 'Connected — scores persist across reloads' : 'Local only — scores clear on reload';
+  try { localStorage.setItem('__qa_test__','1'); localStorage.removeItem('__qa_test__'); localStorageOk = true; } catch(e){ localStorageOk = false; }
+  const statusEl = document.getElementById('persistStatus');
+  if (dbNS) statusEl.textContent = 'Connected — scores persist across reloads';
+  else if (localStorageOk) statusEl.textContent = 'Saved in this browser — persists on reload, this device only';
+  else statusEl.textContent = 'Local only — scores clear on reload (browser storage unavailable)';
 }
 async function loadDoc(docId){
   if (dbNS){ try { const snap = await dbNS.collection('qa_scores').doc(docId).get(); if (snap.exists) return snap.data(); } catch(e){} }
+  const ls = lsGet(docId);
+  if (ls) return ls;
   return localScores[docId] || null;
 }
 async function saveDoc(docId, payload){
-  localScores[docId] = payload;
-  if (dbNS){ try { await dbNS.collection('qa_scores').doc(docId).set(payload); return true; } catch(e){ return false; } }
-  return false;
+  localScores[docId] = payload; // always kept as a cheap in-memory safety net too
+  if (dbNS){ try { await dbNS.collection('qa_scores').doc(docId).set(payload); return true; } catch(e){} }
+  return lsSet(docId, payload);
 }
 async function queryAll(){
   if (dbNS){ try { const qs = await dbNS.collection('qa_scores').limit(500).get(); return qs.docs.map(d => d.data()); } catch(e){} }
+  const ls = lsAll();
+  if (ls.length) return ls;
   return Object.values(localScores);
+}
+
+/* Reconstruct the docId a saved record originally used — needed to
+   restore imported records to the exact same storage key so re-saving
+   the same episode later overwrites rather than duplicates. */
+function docIdFor(d){
+  if (d.kind === 'c0') return `${d.sessionId}__C0__form`;
+  if (d.kind === 'technical') return `${d.sessionId}__${d.scenarioId}__technical`;
+  if (d.kind === 'participant') return `${d.sessionId}__${d.scenarioId}__ep__${d.episodeId}`;
+  if (d.kind === 'annotations') return `${d.sessionId}__${d.scenarioId}__annotations`;
+  return null;
 }
 
 /* ---------------------------------------------------------------
@@ -930,6 +982,38 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
   const area = document.getElementById('exportArea');
   area.style.display = 'block'; area.value = json; area.select();
   if (downloadsNS){ try { await downloadsNS.save({filename: `qa-scores-${(ingested.sessionId||'session')}.json`, data: json}); } catch(e){} }
+  // Plain download link works here (unlike inside a Claude artifact) since this is a normal static page.
+  try {
+    const blob = new Blob([json], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `qa-scores-${(ingested.sessionId||'session')}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch(e){}
+});
+
+const importInput = document.getElementById('importInput');
+document.getElementById('importBtn').addEventListener('click', () => importInput.click());
+importInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0]; if (!file) return;
+  try {
+    const docs = JSON.parse(await file.text());
+    let count = 0;
+    for (const d of docs){
+      const docId = docIdFor(d);
+      if (!docId) continue;
+      await saveDoc(docId, d);
+      count++;
+    }
+    formCache = {}; annotationsCache = {}; // drop caches so re-renders pick up the imported values
+    renderSavedList(); renderSessionBanner();
+    if (currentScenarioId) { renderScenarioShell(); }
+    logLine(`<span class="tag ok">import</span> loaded ${count} saved record(s) from ${escapeHtml(file.name)}`);
+  } catch(err){
+    logLine(`<span class="tag warn">import failed</span> ${escapeHtml(err.message)}`);
+  }
+  importInput.value = '';
 });
 
 (async function init(){
