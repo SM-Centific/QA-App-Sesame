@@ -6,7 +6,7 @@ QA scoring and review tool for Sesame capture sessions — scores C0/T1 episodes
 
 ## Status
 
-Working prototype. Persistence is currently **browser localStorage** (per-device, not shared between reviewers) — a deliberate stand-in for the real backend, which will be a SharePoint Excel workbook written to via Power Automate flows. See `docs/power-automate-spec.md` for that plan. Nothing else in the app needs to change when that lands — `loadDoc`/`saveDoc`/`queryAll` in `app.js` are the only three functions that talk to storage.
+Working prototype. Persistence is **live and shared** — scores read/write to a SharePoint Excel workbook (`tbl_qa_scores`) via three Power Automate flows (`QAACCESS_READ_URL`, `QASCORES_READ_URL`, `QASCORES_WRITE_URL`); see `docs/power-automate-spec.md` and `docs/power-automate-expression-notes.md` for how those were built. Access is gated by email against `tbl_qa_access` — the app is unusable until an authorized email signs in. `localStorage` still exists as an automatic fallback (every save writes there too) so a network hiccup never loses data, it just doesn't sync until the next successful write.
 
 ## What it does
 
@@ -45,12 +45,11 @@ Drop these in (any order, any filename — content is auto-classified):
 - **Session gate is strict** — all four scenarios (C0 + 3 rooms) must individually pass. No blended session average substitutes for this.
 - Moderators see the same session rollup as anyone else — they own both Technical and Participant scoring, so there's no separate restricted view.
 
-## Persistence & sharing data between reviewers (current, temporary state)
+## Persistence & access
 
-Scores save to `localStorage` in whichever browser you're using — they'll survive a reload, but they're **not** visible to anyone else, or to you on a different device. Until the Power Automate backend is wired:
-
-- **Export all (.json)** downloads everything saved so far.
-- **Import (.json)** loads a previously-exported file back in (e.g. to combine two reviewers' sessions, or move your work to another browser/device).
+- **Sign-in:** enter your work email on load. Checked against `tbl_qa_access`; not authorized → no access to the app at all.
+- **Scores:** shared across every reviewer via SharePoint, not per-browser. If the network or a flow call fails, the save still lands in `localStorage` as a fallback, and a warning-free retry happens automatically on the next successful save.
+- **Export all (.json)** / **Import (.json)** still exist — useful for backups, or moving work between devices in a pinch, independent of the live backend.
 
 ## Repo structure
 
@@ -59,7 +58,8 @@ index.html   — page structure
 style.css    — all styling
 app.js       — ingestion, scoring, rendering, persistence
 docs/
-  power-automate-spec.md   — draft spec for the real backend (Power Automate flows + Excel tables + access control)
+  power-automate-spec.md              — spec for the backend (flows + Excel tables + access control) — implemented, not just a plan
+  power-automate-expression-notes.md  — syntax gotchas learned building the flows (worth reading before touching them)
 ```
 
 ## Companion tools (not part of this repo, run locally)
