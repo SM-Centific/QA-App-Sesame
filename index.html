@@ -26,7 +26,7 @@
 <header class="top">
   <div>
     <h1>Capture QA Review — Trial v2</h1>
-    <div class="sub">Upload session JSON + capture videos · scores episodes · live Blue/Orange zone overlay from mmWave tracks</div>
+    <div class="sub">Upload session JSON + capture videos · scores episodes · live Blue Zone overlay from video detection</div>
   </div>
   <div style="text-align:right;">
     <div class="sub" id="persistStatus">Checking persistence…</div>
@@ -39,7 +39,7 @@
     <div class="panel">
       <h2>Load session files &amp; videos</h2>
       <div class="dropzone" id="dropzone">
-        Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json,<br>mmwave tracks.jsonl, and capture video files here<br>— or click to browse
+        Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json,<br>*.video_zone.jsonl, and capture video files here<br>— or click to browse
         <input type="file" id="fileInput" multiple accept=".json,.jsonl,.mp4,.mov,.webm,video/*">
       </div>
       <div id="loadLog"></div>

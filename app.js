@@ -43,7 +43,7 @@ let currentUserRole = null;
 --------------------------------------------------------------- */
 let ingested = {
   sessionId: null, scenarios: {}, evidenceByCapture: {}, validationByCapture: {},
-  episodesByCapture: {}, auditByScenario: {}, tracksByCapture: {}, videosByCapture: {},
+  episodesByCapture: {}, auditByScenario: {}, videosByCapture: {},
   videoZoneByCapture: {},
 };
 let currentScenarioId = null;
@@ -54,6 +54,7 @@ let annotationsCache = {}; // scenarioId -> array of {id, type, timeSec, text, c
 let localScores = {};
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
+let activeVideoObj = null; // whichever videosByCapture entry currently holds a live blob URL, if any
 
 function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function logLine(html){ const el = document.getElementById('loadLog'); const d = document.createElement('div'); d.innerHTML = html; el.appendChild(d); el.scrollTop = el.scrollHeight; }
@@ -220,13 +221,6 @@ function ingestVideoZone(lines, filename){
   logLine(`<span class="tag ok">video zone log</span> ${lines.length} samples (${detected} with a detection) for ${escapeHtml(captureId)}`);
 }
 
-function ingestTracks(lines, filename){
-  const captureId = deriveCaptureIdFromName(filename);
-  if (!captureId){ logLine(`<span class="tag warn">skip</span> ${escapeHtml(filename)} — couldn't detect capture id from filename for tracks file`); return; }
-  ingested.tracksByCapture[captureId] = lines;
-  logLine(`<span class="tag ok">mmwave tracks</span> ${lines.length} frames for ${escapeHtml(captureId)}`);
-}
-
 function classifyAndIngest(filename, text){
   try {
     const obj = JSON.parse(text);
@@ -239,7 +233,10 @@ function classifyAndIngest(filename, text){
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean).map(l => { try { return JSON.parse(l); } catch(e){ return null; } }).filter(Boolean);
     if (!lines.length){ logLine(`<span class="tag warn">unrecognized</span> ${escapeHtml(filename)} (could not parse)`); return; }
     if (lines[0].type && String(lines[0].type).startsWith('capture.episode')){ ingestEpisodeMarkers(lines, filename); return; }
-    if (lines[0].schemaVersion === 'hydra.mmwave-tracks/1' || (lines[0].frameIndex != null && 'tracks' in lines[0])){ ingestTracks(lines, filename); return; }
+    if (lines[0].schemaVersion === 'hydra.mmwave-tracks/1' || (lines[0].frameIndex != null && 'tracks' in lines[0])){
+      logLine(`<span class="tag warn">skipped</span> ${escapeHtml(filename)} — mmWave tracks are no longer used (unreliable, and heavy on memory); drop a *.video_zone.jsonl instead`);
+      return;
+    }
     if ('azimuth_deg' in lines[0] && 'in_blue_zone' in lines[0]){ ingestVideoZone(lines, filename); return; }
     logLine(`<span class="tag warn">unrecognized</span> ${escapeHtml(filename)} (JSONL, unknown shape)`);
   }
@@ -248,8 +245,11 @@ function classifyAndIngest(filename, text){
 function ingestVideo(file){
   const captureId = deriveCaptureIdFromName(file.name);
   if (!captureId){ logLine(`<span class="tag warn">skip</span> ${escapeHtml(file.name)} — couldn't detect capture id from filename`); return; }
-  const url = URL.createObjectURL(file);
-  ingested.videosByCapture[captureId] = { name: file.name, url };
+  // Keep just the raw File reference for now — cheap, no blob URL created yet.
+  // The URL is only created lazily when this capture's video is actually opened
+  // (see renderScenarioShell), so loading several videos at once doesn't hold
+  // several live blobs in memory simultaneously.
+  ingested.videosByCapture[captureId] = { name: file.name, file, url: null };
   logLine(`<span class="tag ok">video</span> ${escapeHtml(file.name)} → ${escapeHtml(captureId)}`);
 }
 
@@ -591,15 +591,6 @@ async function computeSessionSummary(){
 /* ---------------------------------------------------------------
    Zone classification
 --------------------------------------------------------------- */
-function classifyZone(track){
-  if (!track || track.rangeM == null || track.azimuthDeg == null) return {label: 'No lock', cls: 'muted'};
-  const r = track.rangeM, a = track.azimuthDeg, inFov = Math.abs(a) <= 60;
-  if (inFov && r <= 5) return {label: 'Blue zone', cls: 'blue'};
-  if (!inFov && r <= 2) return {label: 'Orange zone', cls: 'orange'};
-  if (!inFov && r > 3) return {label: 'Past 3m warning', cls: 'fail'};
-  if (!inFov) return {label: 'Outside FOV (2–3m)', cls: 'warn'};
-  return {label: 'Beyond 5m', cls: 'warn'};
-}
 function classifyZoneVideo(sample){
   if (!sample || sample.azimuth_deg == null) return {label: 'No detection', cls: 'muted'};
   return sample.in_blue_zone ? {label: 'Blue zone', cls: 'blue'} : {label: 'Outside blue zone', cls: 'warn'};
@@ -626,9 +617,8 @@ function renderScenarioTabs(){
     let flags = '';
     if (s){
       const hasVideo = !!ingested.videosByCapture[s.captureId];
-      const hasTracks = !!ingested.tracksByCapture[s.captureId];
       const hasVideoZone = !!ingested.videoZoneByCapture[s.captureId];
-      const zoneFlag = id !== 'C0' ? (hasVideoZone ? ' · video-zone ✓' : (hasTracks ? ' · tracks ✓' : ' · no zone data')) : '';
+      const zoneFlag = id !== 'C0' ? (hasVideoZone ? ' · video-zone ✓' : ' · no zone data') : '';
       flags = `<span class="flags">${hasVideo ? 'video ✓' : 'no video'}${zoneFlag}</span>`;
     }
     return `<button class="${active}" data-scenario="${id}" ${disabled}>${id}${s ? `<span class="room">${escapeHtml(s.roomLabel)}</span>${flags}` : ''}</button>`;
@@ -708,6 +698,28 @@ async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId, autos
 }
 
 /* ---------------------------------------------------------------
+   Video blob lifecycle — only one capture's video blob is ever kept
+   alive at a time, created the moment its scenario is opened and
+   released the moment another one takes its place. Keeps memory use
+   flat regardless of how many videos were dropped into the session.
+--------------------------------------------------------------- */
+function releaseActiveVideo(){
+  if (activeVideoObj && activeVideoObj.url){
+    URL.revokeObjectURL(activeVideoObj.url);
+    activeVideoObj.url = null;
+  }
+  activeVideoObj = null;
+}
+function activateVideo(video){
+  if (activeVideoObj === video) return; // same one already active — don't recreate/reset playback
+  releaseActiveVideo();
+  if (video && video.file){
+    video.url = URL.createObjectURL(video.file);
+    activeVideoObj = video;
+  }
+}
+
+/* ---------------------------------------------------------------
    Rendering: scenario shell (video + zone overlay + episode selector
    + scope sub-tabs). Rebuilt only on scenario change, so the <video>
    element is never recreated on episode/scope switches or saves.
@@ -716,6 +728,7 @@ async function renderScenarioShell(){
   const shell = document.getElementById('scenarioShell');
   videoEl = null;
   if (!currentScenarioId || !ingested.scenarios[currentScenarioId]){
+    releaseActiveVideo(); // nothing will be shown, so don't keep any blob alive
     shell.innerHTML = `<div class="empty-state">Choose a scenario on the left to begin scoring.</div>`;
     return;
   }
@@ -723,15 +736,15 @@ async function renderScenarioShell(){
   const episodes = ingested.episodesByCapture[scenario.captureId] || [];
   if (!currentEpisodeId && episodes.length) currentEpisodeId = episodes[0].episodeId;
   const video = ingested.videosByCapture[scenario.captureId];
+  activateVideo(video); // lazily create this one's blob URL, releasing whichever other one was active
   const audit = ingested.auditByScenario[currentScenarioId];
-  const tracks = ingested.tracksByCapture[scenario.captureId];
   const videoZone = ingested.videoZoneByCapture[scenario.captureId];
-  const zoneSource = videoZone ? 'video' : (tracks ? 'mmwave' : null);
+  const zoneSource = videoZone ? 'video' : null;
   const isC0 = currentScenarioId === 'C0';
 
   const auditLine = audit ? `<div class="audit-line">Devices required: ${escapeHtml(audit.expectedDevices.join(', '))}</div>` : '';
   const videoHtml = video
-    ? `<video id="capVideo" controls src="${video.url}"></video>`
+    ? `<video id="capVideo" controls preload="metadata" src="${video.url}"></video>`
     : `<div class="no-video">No video uploaded for ${escapeHtml(scenario.captureId)} yet.</div>`;
   const zoneHtml = (zoneSource && video)
     ? `<div class="zone-panel">
@@ -742,7 +755,7 @@ async function renderScenarioShell(){
          </svg>
          <div class="zone-badge muted" id="zoneBadge">No lock</div>
          <div class="zone-readout" id="zoneReadout">–</div>
-         <div class="zone-readout" style="opacity:.7">source: ${zoneSource === 'video' ? 'video detection' : 'mmWave (unvalidated)'}</div>
+         <div class="zone-readout" style="opacity:.7">source: video detection</div>
        </div>`
     : '';
 
@@ -863,30 +876,6 @@ async function renderScenarioShell(){
         dot.setAttribute('cy', Math.max(10, Math.min(125, cy)));
       }
     });
-  } else if (zoneSource === 'mmwave' && video && videoEl){
-    const t0 = scenario.startedAt ? Date.parse(scenario.startedAt) : null;
-    const frames = tracks.map(f => ({ ...f, __t: t0 != null ? (Date.parse(f.hostintrReadyUtc) - t0) / 1000 : null })).filter(f => f.__t != null);
-    frames.sort((a,b) => a.__t - b.__t);
-    let lastUpdate = 0;
-    videoEl.addEventListener('timeupdate', () => {
-      const now = performance.now();
-      if (now - lastUpdate < 200) return;
-      lastUpdate = now;
-      const frame = nearestTrackFrame(frames, videoEl.currentTime);
-      const track = frame ? frame.activeTrack : null;
-      const zone = classifyZone(track);
-      const badge = document.getElementById('zoneBadge');
-      const readout = document.getElementById('zoneReadout');
-      const dot = document.getElementById('zoneDot');
-      if (badge){ badge.className = 'zone-badge ' + zone.cls; badge.textContent = zone.label; }
-      if (readout) readout.textContent = track ? `${track.rangeM.toFixed(2)}m @ ${track.azimuthDeg.toFixed(0)}°` : '–';
-      if (dot && track && track.xM != null && track.yM != null){
-        const cx = 80 + Math.max(-60, Math.min(60, track.xM * 16));
-        const cy = 110 - Math.max(0, Math.min(95, track.yM * 16));
-        dot.setAttribute('cx', cx); dot.setAttribute('cy', cy);
-      }
-    });
-    if (!t0) logLine(`<span class="tag warn">note</span> ${escapeHtml(currentScenarioId)}: capture.json has no startedAt — zone overlay timing may drift`);
   }
 
   renderScoringSection();

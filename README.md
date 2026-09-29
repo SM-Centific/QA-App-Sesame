@@ -35,7 +35,7 @@ Drop these in (any order, any filename — content is auto-classified):
 | `session_validation.json` | per session | Audio/Video Quality auto-flags |
 | capture video (`.mp4`) | per capture | the player itself |
 | `*.video_zone.jsonl` | per capture (T1 only) | Blue Zone % auto-fill — see `extract_video_zone.py` |
-| mmWave `tracks.jsonl` | per capture (T1 only) | fallback zone overlay if no video-zone log is present (kept for reference; the video-based detector is preferred — see project history for why) |
+
 
 ## Scoring model
 
@@ -65,4 +65,4 @@ docs/
 ## Companion tools (not part of this repo, run locally)
 
 - `extract_video_zone.py` — runs person detection on a capture's ERP video, outputs the `*.video_zone.jsonl` log this app ingests for Blue Zone %.
-- `extract_mmwave_diagnostics.py` — raw mmWave `.bin` → range/velocity/phase diagnostics. Kept for reference from an earlier investigation into radar-based zone detection; superseded by the video-based approach for Blue Zone specifically.
+- `extract_mmwave_diagnostics.py` — raw mmWave `.bin` → range/velocity/phase diagnostics. Kept for reference from an earlier investigation into radar-based zone detection; the app itself no longer ingests mmWave tracks at all (dropped — unreliable, and heavy on memory for large sessions), superseded entirely by the video-based detector.
