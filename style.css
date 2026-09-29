@@ -205,3 +205,21 @@
 .annotation-row .a-del:hover { color: var(--fail); }
 .annotation-row.flag { border-left: 3px solid var(--fail); }
 .annotation-row.comment { border-left: 3px solid var(--accent); }
+
+/* ---------------------------------------------------------------
+   Access gate (sign-in)
+--------------------------------------------------------------- */
+.access-gate {
+  position: fixed; inset: 0; z-index: 100; background: var(--bg);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.access-box {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 28px; max-width: 360px; width: 100%; text-align: center;
+}
+.access-box h2 { margin: 0 0 8px; font-size: 18px; }
+.access-box p { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+.access-box input { width: 100%; margin-bottom: 12px; text-align: center; }
+.access-box button { width: 100%; }
+.access-msg { color: var(--fail); font-size: 12.5px; margin-top: 10px; min-height: 1em; }
+#signOutBtn { color: var(--accent); }

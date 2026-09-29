@@ -29,6 +29,16 @@ const SCENARIO_ORDER = ['C0','T1-R1','T1-R2','T1-R3'];
 const MIN_GOOD_EPISODES = 10; // client threshold: a room needs at least this many PASSED episodes
 
 /* ---------------------------------------------------------------
+   Backend (Power Automate + SharePoint Excel). See docs/power-automate-spec.md.
+--------------------------------------------------------------- */
+const QAACCESS_READ_URL = "https://default9b415834803a4da0afdcfe6b1d52d6.49.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/05/workflows/152a06201a4642339d1e07e930f329d4/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=WorDH8s8grB_3ocp4OmNI5BuSHcx5yA98pjAufZddjU";
+const QASCORES_READ_URL = "https://default9b415834803a4da0afdcfe6b1d52d6.49.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/20/workflows/5e00c2485f8a44129e2aeff73933d0d3/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=RzjbtxXXZMLc7k5Z55NPPqrqwGmIddDQw8rpKr2dsRI";
+const QASCORES_WRITE_URL = "https://default9b415834803a4da0afdcfe6b1d52d6.49.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/04/workflows/99955cada8a441b6a27b171c0f617686/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=XhQwo6f1r_avdZJbufnezrS-szlvNFQQLoBifdIegxU";
+
+let currentUserEmail = null;
+let currentUserRole = null;
+
+/* ---------------------------------------------------------------
    Ingested session state
 --------------------------------------------------------------- */
 let ingested = {
@@ -368,29 +378,93 @@ function lsAll(){
   return out;
 }
 
+let remoteCache = null; // array of parsed score payloads, once a QASCORES_READ_URL fetch succeeds
+
 async function initCapabilities(){
   try {
     if (window.claude && window.claude.use){ dbNS = await window.claude.use('db'); downloadsNS = await window.claude.use('downloads'); }
   } catch(e){ dbNS = null; downloadsNS = null; }
   try { localStorage.setItem('__qa_test__','1'); localStorage.removeItem('__qa_test__'); localStorageOk = true; } catch(e){ localStorageOk = false; }
   const statusEl = document.getElementById('persistStatus');
-  if (dbNS) statusEl.textContent = 'Connected — scores persist across reloads';
-  else if (localStorageOk) statusEl.textContent = 'Saved in this browser — persists on reload, this device only';
-  else statusEl.textContent = 'Local only — scores clear on reload (browser storage unavailable)';
+  if (dbNS) { statusEl.textContent = 'Connected — scores persist across reloads'; return; }
+  // Try the real backend once at startup; fall back to a local-only message if it's unreachable.
+  const fetched = await fetchAllFromRemote();
+  if (fetched != null) statusEl.textContent = 'Connected to SharePoint — scores shared across reviewers';
+  else if (localStorageOk) statusEl.textContent = 'Backend unreachable — saved in this browser only, this device';
+  else statusEl.textContent = 'Local only — scores clear on reload (backend and browser storage both unavailable)';
 }
+
+async function checkAccess(email){
+  try {
+    const res = await fetch(QAACCESS_READ_URL, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({email}),
+    });
+    if (!res.ok) return {authorized: false, networkError: true};
+    return await res.json();
+  } catch(e){ return {authorized: false, networkError: true}; }
+}
+
+async function fetchAllFromRemote(){
+  try {
+    const res = await fetch(QASCORES_READ_URL, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+    });
+    if (!res.ok) throw new Error('bad status ' + res.status);
+    const data = await res.json();
+    const rows = (data && (data.value || (data.body && data.body.value))) || [];
+    remoteCache = rows.map(r => {
+      try { return JSON.parse(r.payload_json); } catch(e){ return null; }
+    }).filter(Boolean);
+    return remoteCache;
+  } catch(e){
+    return null; // caller falls back to localStorage/in-memory
+  }
+}
+
+function rowForDoc(docId, payload){
+  return {
+    doc_id: docId,
+    session_id: payload.sessionId || '',
+    scenario_id: payload.scenarioId || '',
+    episode_id: payload.episodeId || '',
+    kind: payload.kind || '',
+    payload_json: JSON.stringify(payload),
+    saved_at: payload.savedAt || new Date().toISOString(),
+  };
+}
+
 async function loadDoc(docId){
   if (dbNS){ try { const snap = await dbNS.collection('qa_scores').doc(docId).get(); if (snap.exists) return snap.data(); } catch(e){} }
-  const ls = lsGet(docId);
-  if (ls) return ls;
-  return localScores[docId] || null;
+  const all = await queryAll();
+  const found = all.find(d => docIdFor(d) === docId);
+  if (found) return found;
+  return lsGet(docId) || localScores[docId] || null;
 }
+
 async function saveDoc(docId, payload){
-  localScores[docId] = payload; // always kept as a cheap in-memory safety net too
+  localScores[docId] = payload; // in-memory safety net
+  lsSet(docId, payload);        // local mirror — keeps the app usable even if the network write below fails
   if (dbNS){ try { await dbNS.collection('qa_scores').doc(docId).set(payload); return true; } catch(e){} }
-  return lsSet(docId, payload);
+  try {
+    const res = await fetch(QASCORES_WRITE_URL, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(rowForDoc(docId, payload)),
+    });
+    if (!res.ok) throw new Error('bad status ' + res.status);
+    if (remoteCache){
+      const idx = remoteCache.findIndex(d => docIdFor(d) === docId);
+      if (idx >= 0) remoteCache[idx] = payload; else remoteCache.push(payload);
+    }
+    return true;
+  } catch(e){
+    return false; // still saved locally above — not a total loss, just not shared yet
+  }
 }
+
 async function queryAll(){
   if (dbNS){ try { const qs = await dbNS.collection('qa_scores').limit(500).get(); return qs.docs.map(d => d.data()); } catch(e){} }
+  if (remoteCache != null) return remoteCache;
+  const fetched = await fetchAllFromRemote();
+  if (fetched != null) return fetched;
   const ls = lsAll();
   if (ls.length) return ls;
   return Object.values(localScores);
@@ -975,7 +1049,12 @@ fileInput.addEventListener('change', e => { if (e.target.files.length) handleFil
 ['dragleave','drop'].forEach(evt => dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
 dropzone.addEventListener('drop', e => { if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
 
-document.getElementById('refreshSavedBtn').addEventListener('click', () => { renderSavedList(); renderSessionBanner(); });
+document.getElementById('refreshSavedBtn').addEventListener('click', async () => {
+  remoteCache = null; // force a fresh fetch instead of reusing whatever was cached
+  await queryAll();
+  renderSavedList(); renderSessionBanner();
+  if (currentScenarioId) { formCache = {}; renderScoringSection(); }
+});
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const docs = await queryAll();
   const json = JSON.stringify(docs, null, 2);
@@ -1016,9 +1095,64 @@ importInput.addEventListener('change', async (e) => {
   importInput.value = '';
 });
 
-(async function init(){
-  await initCapabilities();
-  renderScenarioTabs();
-  renderSavedList();
-  renderSessionBanner();
+/* ---------------------------------------------------------------
+   Access gate — checked against tbl_qa_access via QAACCESS_READ_URL.
+   Nothing else in the app renders until this passes. The email is
+   remembered in localStorage purely for convenience (skip retyping
+   it every visit); the real check still runs every time, server-side.
+--------------------------------------------------------------- */
+function showApp(){
+  document.getElementById('accessGate').style.display = 'none';
+  document.getElementById('appRoot').style.display = '';
+}
+
+async function attemptAccess(email){
+  const msgEl = document.getElementById('accessMsg');
+  const submitBtn = document.getElementById('accessSubmit');
+  if (msgEl) msgEl.textContent = '';
+  if (submitBtn){ submitBtn.disabled = true; submitBtn.textContent = 'Checking…'; }
+  const result = await checkAccess(email);
+  if (submitBtn){ submitBtn.disabled = false; submitBtn.textContent = 'Continue'; }
+  if (result.authorized){
+    currentUserEmail = email; currentUserRole = result.role || null;
+    try { localStorage.setItem('qa_app_user_email', email); } catch(e){}
+    const who = document.getElementById('signedInAs');
+    if (who) who.textContent = `${email}${currentUserRole ? ' · ' + currentUserRole : ''}`;
+    showApp();
+    await initCapabilities();
+    renderScenarioTabs();
+    renderSavedList();
+    renderSessionBanner();
+    return true;
+  }
+  if (msgEl){
+    msgEl.textContent = result.networkError
+      ? "Couldn't reach the access check right now — check your connection and try again."
+      : "This email doesn't have access to the QA review tool.";
+  }
+  return false;
+}
+
+document.getElementById('accessSubmit').addEventListener('click', () => {
+  const email = document.getElementById('accessEmail').value.trim();
+  if (email) attemptAccess(email);
+});
+document.getElementById('accessEmail').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('accessSubmit').click();
+});
+document.getElementById('signOutBtn').addEventListener('click', () => {
+  try { localStorage.removeItem('qa_app_user_email'); } catch(e){}
+  currentUserEmail = null; currentUserRole = null;
+  document.getElementById('appRoot').style.display = 'none';
+  document.getElementById('accessGate').style.display = '';
+  document.getElementById('accessEmail').value = '';
+});
+
+(function initGate(){
+  let remembered = null;
+  try { remembered = localStorage.getItem('qa_app_user_email'); } catch(e){}
+  if (remembered){
+    document.getElementById('accessEmail').value = remembered;
+    attemptAccess(remembered);
+  }
 })();
