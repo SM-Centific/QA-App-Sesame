@@ -51,6 +51,8 @@ let currentEpisodeId = null;
 let currentScope = 'technical'; // 'technical' | 'participant' — only meaningful for T1 scenarios
 let formCache = {};
 let annotationsCache = {}; // scenarioId -> array of {id, type, timeSec, text, createdAt}
+let autoSaveTimers = {}; // docId -> pending setTimeout handle, for debounced autosave
+let activeForm = null;   // {docId, items, kind, scenarioId, episodeId} for whichever form is currently on screen — lets episode/scope/scenario switches flush a pending autosave before tearing the form down
 let localScores = {};
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
@@ -625,6 +627,7 @@ function renderScenarioTabs(){
   }).join('');
   el.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', () => {
+      flushActiveAutoSave();
       currentScenarioId = btn.dataset.scenario; currentEpisodeId = null; currentScope = 'technical';
       renderScenarioTabs(); renderScenarioShell();
     });
@@ -725,6 +728,7 @@ function activateVideo(video){
    element is never recreated on episode/scope switches or saves.
 --------------------------------------------------------------- */
 async function renderScenarioShell(){
+  flushActiveAutoSave();
   const shell = document.getElementById('scenarioShell');
   videoEl = null;
   if (!currentScenarioId || !ingested.scenarios[currentScenarioId]){
@@ -761,9 +765,11 @@ async function renderScenarioShell(){
 
   const episodeSelectHtml = episodes.length ? `
     <div class="episode-select-row">
+      <button class="btn" id="prevEpBtn" title="Previous episode">‹ Prev</button>
       <select id="episodeSelect">
         ${episodes.map(e => `<option value="${e.episodeId}" ${e.episodeId===currentEpisodeId?'selected':''}>Episode ${e.episodeNumber ?? '?'}${(e.invalidReasons&&e.invalidReasons.length)?' ⚠':''}</option>`).join('')}
       </select>
+      <button class="btn" id="nextEpBtn" title="Next episode">Next ›</button>
       <button class="btn" id="seekBtn">Jump to episode start</button>
       <span class="episode-info" id="episodeInfo"></span>
     </div>` : `<div class="episode-info">No episode_markers loaded for this room.</div>`;
@@ -802,10 +808,15 @@ async function renderScenarioShell(){
   videoEl = document.getElementById('capVideo');
   const epSelect = document.getElementById('episodeSelect');
   const seekBtn = document.getElementById('seekBtn');
+  const prevEpBtn = document.getElementById('prevEpBtn');
+  const nextEpBtn = document.getElementById('nextEpBtn');
   const episodeInfo = document.getElementById('episodeInfo');
 
   shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(btn => {
-    btn.addEventListener('click', () => { currentScope = btn.dataset.scope; shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(b=>b.classList.toggle('active', b===btn)); renderScoringSection(); });
+    btn.addEventListener('click', () => {
+      flushActiveAutoSave();
+      currentScope = btn.dataset.scope; shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(b=>b.classList.toggle('active', b===btn)); renderScoringSection();
+    });
   });
 
   function updateEpisodeInfo(){
@@ -816,10 +827,39 @@ async function renderScenarioShell(){
   }
   updateEpisodeInfo();
 
-  if (epSelect) epSelect.addEventListener('change', () => { currentEpisodeId = epSelect.value; updateEpisodeInfo(); renderScoringSection(); });
-  if (seekBtn) seekBtn.addEventListener('click', () => {
-    const ep = episodes.find(e => e.episodeId === currentEpisodeId);
+  function updateNavButtonStates(){
+    const idx = episodes.findIndex(e => e.episodeId === currentEpisodeId);
+    if (prevEpBtn) prevEpBtn.disabled = idx <= 0;
+    if (nextEpBtn) nextEpBtn.disabled = idx < 0 || idx >= episodes.length - 1;
+  }
+  updateNavButtonStates();
+
+  // Shared by the dropdown, the explicit seek button, and prev/next — jumping
+  // to an episode always moves the video to its start, with no separate click
+  // required to also seek (previously picking an episode from the dropdown
+  // only switched the scoring form; seeking needed its own button press).
+  function seekToEpisodeStart(ep){
     if (ep && ep.startElapsedMs != null && videoEl) videoEl.currentTime = ep.startElapsedMs / 1000;
+  }
+  function switchToEpisode(episodeId){
+    flushActiveAutoSave();
+    currentEpisodeId = episodeId;
+    if (epSelect) epSelect.value = episodeId;
+    updateEpisodeInfo();
+    updateNavButtonStates();
+    seekToEpisodeStart(episodes.find(e => e.episodeId === episodeId));
+    renderScoringSection();
+  }
+
+  if (epSelect) epSelect.addEventListener('change', () => switchToEpisode(epSelect.value));
+  if (seekBtn) seekBtn.addEventListener('click', () => seekToEpisodeStart(episodes.find(e => e.episodeId === currentEpisodeId)));
+  if (prevEpBtn) prevEpBtn.addEventListener('click', () => {
+    const idx = episodes.findIndex(e => e.episodeId === currentEpisodeId);
+    if (idx > 0) switchToEpisode(episodes[idx - 1].episodeId);
+  });
+  if (nextEpBtn) nextEpBtn.addEventListener('click', () => {
+    const idx = episodes.findIndex(e => e.episodeId === currentEpisodeId);
+    if (idx >= 0 && idx < episodes.length - 1) switchToEpisode(episodes[idx + 1].episodeId);
   });
 
   // Video annotations (flags + timestamped comments) — tied to the scenario's
@@ -907,8 +947,10 @@ async function renderScoringSection(){
           <span class="saved-at" id="savedAtLabel">${form.savedAt ? 'Saved ' + new Date(form.savedAt).toLocaleString() : 'Not saved yet'}</span>
         </div>
       </div>`;
-    wireItemInputs('c0Items', docId);
+    wireItemInputs('c0Items', docId, ITEMS_C0, 'c0', 'C0', null);
+    wireNotesField('notesField', docId, ITEMS_C0, 'c0', 'C0', null);
     wireSaveButton(docId, ITEMS_C0, 'c0', 'C0', null, 'saveBtn');
+    activeForm = {docId, items: ITEMS_C0, kind: 'c0', scenarioId: 'C0', episodeId: null};
     return;
   }
 
@@ -933,8 +975,9 @@ async function renderScoringSection(){
           <span class="saved-at" id="techSavedAtLabel">${techForm.savedAt ? 'Saved ' + new Date(techForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
         </div>
       </div>`;
-    wireItemInputs('techItems', techDocId);
+    wireItemInputs('techItems', techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null);
     wireSaveButton(techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null, 'saveTechBtn');
+    activeForm = {docId: techDocId, items: ITEMS_TECHNICAL, kind: 'technical', scenarioId: currentScenarioId, episodeId: null};
     return;
   }
 
@@ -960,11 +1003,13 @@ async function renderScoringSection(){
         <span class="saved-at" id="epSavedAtLabel">${participantForm.savedAt ? 'Saved ' + new Date(participantForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
       </div>
     </div>`;
-  wireItemInputs('participantItems', epDocId);
+  wireItemInputs('participantItems', epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId);
+  wireNotesField('epNotesField', epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId);
   wireSaveButton(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, 'saveEpBtn');
+  activeForm = {docId: epDocId, items: ITEMS_PARTICIPANT, kind: 'participant', scenarioId: currentScenarioId, episodeId: currentEpisodeId};
 }
 
-function wireItemInputs(containerId, docId){
+function wireItemInputs(containerId, docId, items, kind, scenarioId, episodeId){
   const container = document.getElementById(containerId);
   if (!container) return;
   container.querySelectorAll('.seg').forEach(btn => {
@@ -975,6 +1020,7 @@ function wireItemInputs(containerId, docId){
       if (!formCache[docId]) return;
       formCache[docId].values[itemId] = val;
       renderScoringSection();
+      queueAutoSave(docId, items, kind, scenarioId, episodeId, {delay: 300});
     });
   });
   container.querySelectorAll('input[type="number"][data-item]').forEach(inp => {
@@ -985,31 +1031,106 @@ function wireItemInputs(containerId, docId){
       if (v != null) v = Math.max(0, Math.min(100, v));
       formCache[docId].values[itemId] = v;
       renderScoringSection();
+      queueAutoSave(docId, items, kind, scenarioId, episodeId, {delay: 300});
     });
   });
 }
 
+// Wires the notes textarea to autosave on a debounce, WITHOUT re-rendering
+// the scoring section on every keystroke (that would steal focus/reset the
+// cursor mid-word). This is also the direct fix for notes silently not
+// making it into the scorecard: previously notes only got read out of the
+// textarea at the moment the Save button was clicked, so typing notes and
+// then switching episode/scope without clicking Save first lost them
+// entirely. Now every keystroke is captured into formCache immediately.
+function wireNotesField(fieldId, docId, items, kind, scenarioId, episodeId){
+  const el = document.getElementById(fieldId);
+  if (!el) return;
+  el.addEventListener('input', () => {
+    if (!formCache[docId]) return;
+    formCache[docId].notes = el.value;
+    queueAutoSave(docId, items, kind, scenarioId, episodeId, {delay: 800, skipScoringRerender: true});
+  });
+}
+
+/* ---------------------------------------------------------------
+   Autosave. Every score button and every notes keystroke persists on
+   its own — no save button has to be clicked for data to survive a
+   switch to a different episode/scope/scenario, or a page reload.
+   Discrete inputs (scale/gate buttons) save almost immediately;
+   notes are debounced so typing doesn't fire a save per keystroke.
+   `activeForm` tracks whichever form is currently on screen so a
+   switch can flush any not-yet-fired debounced save first.
+--------------------------------------------------------------- */
+function saveStatusLabelEl(){
+  return document.getElementById('savedAtLabel') || document.getElementById('techSavedAtLabel') || document.getElementById('epSavedAtLabel');
+}
+function setSaveStatus(state, savedAt){
+  const el = saveStatusLabelEl();
+  if (!el) return;
+  if (state === 'saving') el.textContent = 'Saving…';
+  else if (state === 'saved') el.textContent = 'Saved ' + new Date(savedAt).toLocaleTimeString();
+}
+
+async function doAutoSave(docId, items, kind, scenarioId, episodeId, opts){
+  opts = opts || {};
+  const form = formCache[docId];
+  if (!form) return;
+  const scores = computeScores(items, form.values);
+  const payload = {
+    sessionId: ingested.sessionId, scenarioId, episodeId, kind,
+    roomLabel: (ingested.scenarios[scenarioId] || {}).roomLabel || null,
+    scores: form.values, notes: form.notes,
+    p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
+    savedAt: new Date().toISOString(),
+  };
+  setSaveStatus('saving');
+  await saveDoc(docId, payload);
+  form.savedAt = payload.savedAt;
+  setSaveStatus('saved', payload.savedAt);
+  renderSavedList();
+  renderSessionBanner();
+  // Notes autosave skips this to avoid tearing down the textarea the
+  // reviewer is actively typing in (full re-render would steal focus
+  // and reset the cursor position mid-word).
+  if (!opts.skipScoringRerender) renderScoringSection();
+}
+
+function queueAutoSave(docId, items, kind, scenarioId, episodeId, opts){
+  opts = opts || {};
+  clearTimeout(autoSaveTimers[docId]);
+  autoSaveTimers[docId] = setTimeout(() => {
+    delete autoSaveTimers[docId];
+    doAutoSave(docId, items, kind, scenarioId, episodeId, opts);
+  }, opts.delay || 400);
+}
+
+// Called right before switching episode/scope/scenario (or leaving the
+// page), so a debounced save still pending doesn't just get dropped.
+function flushActiveAutoSave(){
+  if (!activeForm) return;
+  const {docId, items, kind, scenarioId, episodeId} = activeForm;
+  if (autoSaveTimers[docId]){
+    clearTimeout(autoSaveTimers[docId]);
+    delete autoSaveTimers[docId];
+    doAutoSave(docId, items, kind, scenarioId, episodeId, {skipScoringRerender: true});
+  }
+}
+window.addEventListener('beforeunload', flushActiveAutoSave);
+
+// The Save button still exists as a manual "save right now" fallback —
+// useful as reassurance, or to force a save through immediately rather
+// than waiting out the debounce — but it is no longer the only thing
+// that persists data; every input already autosaves on its own.
 function wireSaveButton(docId, items, kind, scenarioId, episodeId, btnId){
   const btn = document.getElementById(btnId);
   if (!btn) return;
   btn.addEventListener('click', async () => {
-    const form = formCache[docId];
+    clearTimeout(autoSaveTimers[docId]);
+    delete autoSaveTimers[docId];
     const notesEl = document.getElementById(kind === 'participant' ? 'epNotesField' : 'notesField');
-    if (notesEl) form.notes = notesEl.value;
-    const scores = computeScores(items, form.values);
-    const payload = {
-      sessionId: ingested.sessionId, scenarioId, episodeId, kind,
-      roomLabel: (ingested.scenarios[scenarioId] || {}).roomLabel || null,
-      scores: form.values, notes: form.notes,
-      p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
-      savedAt: new Date().toISOString(),
-    };
-    btn.disabled = true; btn.textContent = 'Saving…';
-    await saveDoc(docId, payload);
-    form.savedAt = payload.savedAt;
-    renderSavedList();
-    renderScoringSection();
-    renderSessionBanner();
+    if (notesEl) formCache[docId].notes = notesEl.value;
+    await doAutoSave(docId, items, kind, scenarioId, episodeId, {});
   });
 }
 
