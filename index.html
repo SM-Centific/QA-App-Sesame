@@ -25,7 +25,8 @@
 
 <header class="top">
   <div class="header-title">
-    <img src="centific_logo.png" alt="Centific" class="header-logo">
+    <img src="centific_logo.png" alt="Centific" class="header-logo logo-light">
+    <img src="centific_logo_white.png" alt="Centific" class="header-logo logo-dark">
     <h1>Project Sesame - QA</h1>
   </div>
   <div style="text-align:right;">
@@ -61,6 +62,9 @@
         <input type="file" id="importInput" accept=".json" style="display:none;">
       </div>
       <textarea id="exportArea" style="display:none;margin-top:8px;" readonly></textarea>
+      <div class="save-row danger-row">
+        <button class="btn danger" id="clearLocalBtn" title="Wipes this browser's local backup copy for the current session only — does not touch SharePoint">Clear local trial data</button>
+      </div>
     </div>
   </div>
 

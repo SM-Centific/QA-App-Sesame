@@ -1,8 +1,14 @@
 :root {
     --bg: #f3f4f6; --panel: #ffffff; --panel-2: #f8f9fb; --border: #d9dde2; --text: #1a2027; --muted: #667080;
-    --accent: #21847a; --accent-soft: #e3f2f0; --warn: #a9701c; --warn-soft: #faf0dd;
+    /* Brand scheme: Centific blue as the structural/active accent (same blue
+       already used for the Blue Zone elsewhere in this file), Centific pink
+       (sampled directly from the logo, #CD128A) as the primary call-to-action
+       color — kept distinct from blue so a "do this" button doesn't compete
+       visually with ordinary active/selected states. */
+    --accent: #3d6fb4; --accent-soft: #e5edf8; --warn: #a9701c; --warn-soft: #faf0dd;
     --fail: #b1483c; --fail-soft: #fbe9e7; --pass: #237a44; --pass-soft: #e5f4ea;
     --blue: #3d6fb4; --blue-soft: #e5edf8; --orange: #c17a2a; --orange-soft: #fbeddd;
+    --brand-pink: #cd128a; --brand-pink-soft: #fbe6f3;
     --font-ui: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
     --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
     box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -10,16 +16,18 @@
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #12161b; --panel: #191f26; --panel-2: #1f262e; --border: #2b333c; --text: #e7ebee; --muted: #8b96a3;
-      --accent: #57c2b5; --accent-soft: #1c2f2c; --warn: #e2ab55; --warn-soft: #332b1a;
+      --accent: #7ea6dd; --accent-soft: #1c2634; --warn: #e2ab55; --warn-soft: #332b1a;
       --fail: #e07a6e; --fail-soft: #372220; --pass: #6fcc8c; --pass-soft: #1c2f21;
       --blue: #7ea6dd; --blue-soft: #1c2634; --orange: #e0a85c; --orange-soft: #332a1c;
+      --brand-pink: #ec4fb0; --brand-pink-soft: #3a1f30;
     }
   }
   :root[data-theme="dark"] {
     --bg: #12161b; --panel: #191f26; --panel-2: #1f262e; --border: #2b333c; --text: #e7ebee; --muted: #8b96a3;
-    --accent: #57c2b5; --accent-soft: #1c2f2c; --warn: #e2ab55; --warn-soft: #332b1a;
+    --accent: #7ea6dd; --accent-soft: #1c2634; --warn: #e2ab55; --warn-soft: #332b1a;
     --fail: #e07a6e; --fail-soft: #372220; --pass: #6fcc8c; --pass-soft: #1c2f21;
     --blue: #7ea6dd; --blue-soft: #1c2634; --orange: #e0a85c; --orange-soft: #332a1c;
+    --brand-pink: #ec4fb0; --brand-pink-soft: #3a1f30;
   }
   html, body { height: 100%; }
   * { box-sizing: border-box; }
@@ -32,6 +40,15 @@
   header.top .sub { color: var(--muted); font-size: 12.5px; }
   .header-title { display: flex; align-items: center; gap: 10px; }
   .header-logo { height: 26px; width: auto; display: block; }
+  /* Light mode: navy-text logo, white-text version hidden. Dark mode: the
+     reverse — the navy text would be invisible against the dark header. */
+  .logo-dark { display: none; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .logo-light { display: none; }
+    :root:not([data-theme="light"]) .logo-dark { display: block; }
+  }
+  :root[data-theme="dark"] .logo-light { display: none; }
+  :root[data-theme="dark"] .logo-dark { display: block; }
   .layout { display: grid; grid-template-columns: 300px minmax(0,1fr); gap: 16px; max-width: 1320px; margin: 0 auto; padding: 16px 20px 48px; }
   @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
   .rail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
@@ -68,7 +85,10 @@
   .badge-result.fail { background: var(--fail-soft); color: var(--fail); }
   .badge-result.incomplete { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
   button.btn { font-family: var(--font-ui); font-size: 12.5px; font-weight: 500; border-radius: 6px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); padding: 7px 12px; cursor: pointer; }
-  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.btn.primary { background: var(--brand-pink); border-color: var(--brand-pink); color: #fff; }
+  button.btn.danger { background: var(--fail-soft); border-color: var(--fail); color: var(--fail); }
+  button.btn.danger:hover { background: var(--fail); color: #fff; }
+  .danger-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
   button.btn:disabled { opacity: .5; cursor: not-allowed; }
   main { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
   .scenario-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 10px; }

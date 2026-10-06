@@ -382,6 +382,31 @@ function lsAll(){
 
 let remoteCache = null; // array of parsed score payloads, once a QASCORES_READ_URL fetch succeeds
 
+/* Wipes this browser's local backup copy (localStorage + the in-memory
+   fallback) for one session only — every docId for a session starts with
+   `${sessionId}__`, so this never touches another session's local data.
+   Does NOT touch SharePoint; it's purely for clearing stale local copies
+   after deleting trial rows from the backend directly, so a leftover
+   local fallback doesn't make a deleted row silently reappear (see the
+   loadDoc fallback chain above). Returns how many local records it removed. */
+function clearLocalCacheForSession(sessionId){
+  if (!sessionId) return 0;
+  let count = 0;
+  const prefix = LS_PREFIX + sessionId + '__';
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++){
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) keysToRemove.push(key);
+    }
+    keysToRemove.forEach(k => { localStorage.removeItem(k); count++; });
+  } catch(e){}
+  Object.keys(localScores).forEach(docId => {
+    if (docId.startsWith(sessionId + '__')) delete localScores[docId];
+  });
+  return count;
+}
+
 async function initCapabilities(){
   try {
     if (window.claude && window.claude.use){ dbNS = await window.claude.use('db'); downloadsNS = await window.claude.use('downloads'); }
@@ -1180,6 +1205,24 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   } catch(e){}
+});
+
+document.getElementById('clearLocalBtn').addEventListener('click', async () => {
+  if (!ingested.sessionId){ logLine(`<span class="tag warn">clear local</span> no session loaded yet`); return; }
+  const ok = confirm(
+    `Clear locally-cached scores for session ${ingested.sessionId}?\n\n` +
+    `This only wipes this browser's local backup copy — it does NOT delete anything from SharePoint. ` +
+    `Use this after you've already deleted trial rows from the SharePoint file directly, so a stale local ` +
+    `copy doesn't make a deleted row silently reappear when you reopen that episode's form.`
+  );
+  if (!ok) return;
+  flushActiveAutoSave();
+  const n = clearLocalCacheForSession(ingested.sessionId);
+  formCache = {}; annotationsCache = {}; remoteCache = null;
+  await queryAll();
+  renderSavedList(); renderSessionBanner();
+  if (currentScenarioId) renderScenarioShell();
+  logLine(`<span class="tag ok">clear local</span> removed ${n} locally-cached record(s) for this session`);
 });
 
 const importInput = document.getElementById('importInput');
