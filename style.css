@@ -40,6 +40,7 @@
   header.top .sub { color: var(--muted); font-size: 12.5px; }
   .header-title { display: flex; align-items: center; gap: 10px; }
   .header-logo { height: 26px; width: auto; display: block; }
+  .header-save { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
   /* Light mode: navy-text logo, white-text version hidden. Dark mode: the
      reverse — the navy text would be invisible against the dark header. */
   .logo-dark { display: none; }

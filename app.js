@@ -51,8 +51,7 @@ let currentEpisodeId = null;
 let currentScope = 'technical'; // 'technical' | 'participant' — only meaningful for T1 scenarios
 let formCache = {};
 let annotationsCache = {}; // scenarioId -> array of {id, type, timeSec, text, createdAt}
-let autoSaveTimers = {}; // docId -> pending setTimeout handle, for debounced autosave
-let activeForm = null;   // {docId, items, kind, scenarioId, episodeId} for whichever form is currently on screen — lets episode/scope/scenario switches flush a pending autosave before tearing the form down
+let activeForm = null;   // {docId, items, kind, scenarioId, episodeId} for whichever form is currently on screen — lets the single global Save button know what to save
 let localScores = {};
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
@@ -652,7 +651,7 @@ function renderScenarioTabs(){
   }).join('');
   el.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', () => {
-      flushActiveAutoSave();
+      captureActiveNotes();
       currentScenarioId = btn.dataset.scenario; currentEpisodeId = null; currentScope = 'technical';
       renderScenarioTabs(); renderScenarioShell();
     });
@@ -753,7 +752,6 @@ function activateVideo(video){
    element is never recreated on episode/scope switches or saves.
 --------------------------------------------------------------- */
 async function renderScenarioShell(){
-  flushActiveAutoSave();
   const shell = document.getElementById('scenarioShell');
   videoEl = null;
   if (!currentScenarioId || !ingested.scenarios[currentScenarioId]){
@@ -839,7 +837,7 @@ async function renderScenarioShell(){
 
   shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(btn => {
     btn.addEventListener('click', () => {
-      flushActiveAutoSave();
+      captureActiveNotes();
       currentScope = btn.dataset.scope; shell.querySelectorAll('.scope-tabs button[data-scope]').forEach(b=>b.classList.toggle('active', b===btn)); renderScoringSection();
     });
   });
@@ -867,7 +865,7 @@ async function renderScenarioShell(){
     if (ep && ep.startElapsedMs != null && videoEl) videoEl.currentTime = ep.startElapsedMs / 1000;
   }
   function switchToEpisode(episodeId){
-    flushActiveAutoSave();
+    captureActiveNotes();
     currentEpisodeId = episodeId;
     if (epSelect) epSelect.value = episodeId;
     updateEpisodeInfo();
@@ -968,13 +966,10 @@ async function renderScoringSection(){
         <div id="c0Items">${ITEMS_C0.map(it => itemRowHtml(it, form.values[it.id], form.autos[it.id])).join('')}</div>
         <div class="notes-block"><label>Reviewer notes</label><textarea id="notesField">${escapeHtml(form.notes)}</textarea></div>
         <div class="save-row">
-          <button class="btn primary" id="saveBtn">Save score</button>
           <span class="saved-at" id="savedAtLabel">${form.savedAt ? 'Saved ' + new Date(form.savedAt).toLocaleString() : 'Not saved yet'}</span>
         </div>
       </div>`;
     wireItemInputs('c0Items', docId, ITEMS_C0, 'c0', 'C0', null);
-    wireNotesField('notesField', docId, ITEMS_C0, 'c0', 'C0', null);
-    wireSaveButton(docId, ITEMS_C0, 'c0', 'C0', null, 'saveBtn');
     activeForm = {docId, items: ITEMS_C0, kind: 'c0', scenarioId: 'C0', episodeId: null};
     return;
   }
@@ -996,12 +991,10 @@ async function renderScoringSection(){
         <div class="section-title">Technical checklist <span class="count">room-level · P0 &amp; P1</span></div>
         <div id="techItems">${ITEMS_TECHNICAL.map(it => itemRowHtml(it, techForm.values[it.id], techForm.autos[it.id])).join('')}</div>
         <div class="save-row">
-          <button class="btn primary" id="saveTechBtn">Save technical score</button>
           <span class="saved-at" id="techSavedAtLabel">${techForm.savedAt ? 'Saved ' + new Date(techForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
         </div>
       </div>`;
     wireItemInputs('techItems', techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null);
-    wireSaveButton(techDocId, ITEMS_TECHNICAL, 'technical', currentScenarioId, null, 'saveTechBtn');
     activeForm = {docId: techDocId, items: ITEMS_TECHNICAL, kind: 'technical', scenarioId: currentScenarioId, episodeId: null};
     return;
   }
@@ -1024,14 +1017,28 @@ async function renderScoringSection(){
       <div id="participantItems">${ITEMS_PARTICIPANT.map(it => itemRowHtml(it, participantForm.values[it.id], participantForm.autos[it.id])).join('')}</div>
       <div class="notes-block"><label>Reviewer notes (this episode)</label><textarea id="epNotesField">${escapeHtml(participantForm.notes)}</textarea></div>
       <div class="save-row">
-        <button class="btn primary" id="saveEpBtn">Save episode score</button>
         <span class="saved-at" id="epSavedAtLabel">${participantForm.savedAt ? 'Saved ' + new Date(participantForm.savedAt).toLocaleString() : 'Not saved yet'}</span>
       </div>
     </div>`;
   wireItemInputs('participantItems', epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId);
-  wireNotesField('epNotesField', epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId);
-  wireSaveButton(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, 'saveEpBtn');
   activeForm = {docId: epDocId, items: ITEMS_PARTICIPANT, kind: 'participant', scenarioId: currentScenarioId, episodeId: currentEpisodeId};
+}
+
+// Pulls whatever's currently typed in the visible notes textarea (if any)
+// into formCache before a re-render replaces that textarea's DOM node —
+// otherwise a re-render driven by an unrelated score-button click would
+// silently discard not-yet-saved notes typing.
+function captureVisibleNotes(docId, kind){
+  const notesEl = document.getElementById(kind === 'participant' ? 'epNotesField' : 'notesField');
+  if (notesEl && formCache[docId]) formCache[docId].notes = notesEl.value;
+}
+// Same capture, but driven by whatever `activeForm` currently is — call
+// this before ANY switch (scenario tab, scope tab, episode change) so
+// typed-but-not-yet-saved notes survive in memory even if the user never
+// touched a score button on that screen before navigating away.
+function captureActiveNotes(){
+  if (!activeForm) return;
+  captureVisibleNotes(activeForm.docId, activeForm.kind);
 }
 
 function wireItemInputs(containerId, docId, items, kind, scenarioId, episodeId){
@@ -1043,49 +1050,31 @@ function wireItemInputs(containerId, docId, items, kind, scenarioId, episodeId){
       const raw = btn.dataset.value;
       const val = (raw === 'pass' || raw === 'fail') ? raw : parseInt(raw, 10);
       if (!formCache[docId]) return;
+      captureVisibleNotes(docId, kind);
       formCache[docId].values[itemId] = val;
       renderScoringSection();
-      queueAutoSave(docId, items, kind, scenarioId, episodeId, {delay: 300});
     });
   });
   container.querySelectorAll('input[type="number"][data-item]').forEach(inp => {
     inp.addEventListener('change', () => {
       const itemId = inp.dataset.item;
       if (!formCache[docId]) return;
+      captureVisibleNotes(docId, kind);
       let v = inp.value === '' ? null : parseFloat(inp.value);
       if (v != null) v = Math.max(0, Math.min(100, v));
       formCache[docId].values[itemId] = v;
       renderScoringSection();
-      queueAutoSave(docId, items, kind, scenarioId, episodeId, {delay: 300});
     });
   });
 }
 
-// Wires the notes textarea to autosave on a debounce, WITHOUT re-rendering
-// the scoring section on every keystroke (that would steal focus/reset the
-// cursor mid-word). This is also the direct fix for notes silently not
-// making it into the scorecard: previously notes only got read out of the
-// textarea at the moment the Save button was clicked, so typing notes and
-// then switching episode/scope without clicking Save first lost them
-// entirely. Now every keystroke is captured into formCache immediately.
-function wireNotesField(fieldId, docId, items, kind, scenarioId, episodeId){
-  const el = document.getElementById(fieldId);
-  if (!el) return;
-  el.addEventListener('input', () => {
-    if (!formCache[docId]) return;
-    formCache[docId].notes = el.value;
-    queueAutoSave(docId, items, kind, scenarioId, episodeId, {delay: 800, skipScoringRerender: true});
-  });
-}
-
 /* ---------------------------------------------------------------
-   Autosave. Every score button and every notes keystroke persists on
-   its own — no save button has to be clicked for data to survive a
-   switch to a different episode/scope/scenario, or a page reload.
-   Discrete inputs (scale/gate buttons) save almost immediately;
-   notes are debounced so typing doesn't fire a save per keystroke.
-   `activeForm` tracks whichever form is currently on screen so a
-   switch can flush any not-yet-fired debounced save first.
+   Saving. One global Save button (wired once, in the header — see
+   near the bottom of this file) saves whatever form is currently on
+   screen. `activeForm` tracks which one that is — set at the end of
+   each of the three render branches above (C0 / Technical /
+   Participant) — so the single button always knows what to save
+   without needing a separate button per section.
 --------------------------------------------------------------- */
 function saveStatusLabelEl(){
   return document.getElementById('savedAtLabel') || document.getElementById('techSavedAtLabel') || document.getElementById('epSavedAtLabel');
@@ -1097,66 +1086,42 @@ function setSaveStatus(state, savedAt){
   else if (state === 'saved') el.textContent = 'Saved ' + new Date(savedAt).toLocaleTimeString();
 }
 
-async function doAutoSave(docId, items, kind, scenarioId, episodeId, opts){
-  opts = opts || {};
-  const form = formCache[docId];
-  if (!form) return;
-  const scores = computeScores(items, form.values);
-  const payload = {
-    sessionId: ingested.sessionId, scenarioId, episodeId, kind,
-    roomLabel: (ingested.scenarios[scenarioId] || {}).roomLabel || null,
-    scores: form.values, notes: form.notes,
-    p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
-    savedAt: new Date().toISOString(),
-  };
+// Saves EVERY form currently sitting in formCache — every episode and
+// scope touched this session, not just whichever one is on screen right
+// now. formCache entries already carry their own items/kind/scenarioId/
+// episodeId (set in ensureFormLoaded), so no navigation is needed to
+// reach them; this is what makes "click Save once before closing" cover
+// everything entered since the page loaded, not just the last screen
+// visited. Annotations (flags/comments) are NOT included here — they
+// already persist immediately on their own, independent of this button.
+async function saveActiveForm(){
+  captureActiveNotes(); // grab whatever's live in the currently-visible notes box first
+  const entries = Object.values(formCache);
+  if (!entries.length){
+    logLine(`<span class="tag warn">save</span> nothing scored yet this session`);
+    return;
+  }
   setSaveStatus('saving');
-  await saveDoc(docId, payload);
-  form.savedAt = payload.savedAt;
-  setSaveStatus('saved', payload.savedAt);
+  let count = 0;
+  for (const form of entries){
+    const {docId, items, kind, scenarioId, episodeId} = form;
+    const scores = computeScores(items, form.values);
+    const payload = {
+      sessionId: ingested.sessionId, scenarioId, episodeId, kind,
+      roomLabel: (ingested.scenarios[scenarioId] || {}).roomLabel || null,
+      scores: form.values, notes: form.notes,
+      p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
+      savedAt: new Date().toISOString(),
+    };
+    await saveDoc(docId, payload);
+    form.savedAt = payload.savedAt;
+    count++;
+  }
+  setSaveStatus('saved', new Date().toISOString());
   renderSavedList();
   renderSessionBanner();
-  // Notes autosave skips this to avoid tearing down the textarea the
-  // reviewer is actively typing in (full re-render would steal focus
-  // and reset the cursor position mid-word).
-  if (!opts.skipScoringRerender) renderScoringSection();
-}
-
-function queueAutoSave(docId, items, kind, scenarioId, episodeId, opts){
-  opts = opts || {};
-  clearTimeout(autoSaveTimers[docId]);
-  autoSaveTimers[docId] = setTimeout(() => {
-    delete autoSaveTimers[docId];
-    doAutoSave(docId, items, kind, scenarioId, episodeId, opts);
-  }, opts.delay || 400);
-}
-
-// Called right before switching episode/scope/scenario (or leaving the
-// page), so a debounced save still pending doesn't just get dropped.
-function flushActiveAutoSave(){
-  if (!activeForm) return;
-  const {docId, items, kind, scenarioId, episodeId} = activeForm;
-  if (autoSaveTimers[docId]){
-    clearTimeout(autoSaveTimers[docId]);
-    delete autoSaveTimers[docId];
-    doAutoSave(docId, items, kind, scenarioId, episodeId, {skipScoringRerender: true});
-  }
-}
-window.addEventListener('beforeunload', flushActiveAutoSave);
-
-// The Save button still exists as a manual "save right now" fallback —
-// useful as reassurance, or to force a save through immediately rather
-// than waiting out the debounce — but it is no longer the only thing
-// that persists data; every input already autosaves on its own.
-function wireSaveButton(docId, items, kind, scenarioId, episodeId, btnId){
-  const btn = document.getElementById(btnId);
-  if (!btn) return;
-  btn.addEventListener('click', async () => {
-    clearTimeout(autoSaveTimers[docId]);
-    delete autoSaveTimers[docId];
-    const notesEl = document.getElementById(kind === 'participant' ? 'epNotesField' : 'notesField');
-    if (notesEl) formCache[docId].notes = notesEl.value;
-    await doAutoSave(docId, items, kind, scenarioId, episodeId, {});
-  });
+  renderScoringSection();
+  logLine(`<span class="tag ok">save</span> saved ${count} form(s) from this session`);
 }
 
 async function renderSavedList(){
@@ -1207,6 +1172,10 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
   } catch(e){}
 });
 
+document.getElementById('globalSaveBtn').addEventListener('click', async () => {
+  await saveActiveForm();
+});
+
 document.getElementById('clearLocalBtn').addEventListener('click', async () => {
   if (!ingested.sessionId){ logLine(`<span class="tag warn">clear local</span> no session loaded yet`); return; }
   const ok = confirm(
@@ -1216,7 +1185,6 @@ document.getElementById('clearLocalBtn').addEventListener('click', async () => {
     `copy doesn't make a deleted row silently reappear when you reopen that episode's form.`
   );
   if (!ok) return;
-  flushActiveAutoSave();
   const n = clearLocalCacheForSession(ingested.sessionId);
   formCache = {}; annotationsCache = {}; remoteCache = null;
   await queryAll();
