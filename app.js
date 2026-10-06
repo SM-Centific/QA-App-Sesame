@@ -1210,9 +1210,9 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 document.getElementById('clearLocalBtn').addEventListener('click', async () => {
   if (!ingested.sessionId){ logLine(`<span class="tag warn">clear local</span> no session loaded yet`); return; }
   const ok = confirm(
-    `Clear locally-cached scores for session ${ingested.sessionId}?\n\n` +
+    `Clear local cache for session ${ingested.sessionId}?\n\n` +
     `This only wipes this browser's local backup copy — it does NOT delete anything from SharePoint. ` +
-    `Use this after you've already deleted trial rows from the SharePoint file directly, so a stale local ` +
+    `Use this after you've already deleted rows from the SharePoint file directly, so a stale local ` +
     `copy doesn't make a deleted row silently reappear when you reopen that episode's form.`
   );
   if (!ok) return;
