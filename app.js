@@ -1028,6 +1028,12 @@ async function renderScoringSection(){
   const blueAuto = computeBlueZoneAuto(currentScenarioId, ep);
   const autos = { blue_zone_pct: blueAuto };
   const participantForm = await ensureFormLoaded(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, autos);
+  // episodeNumber is already known from episode_markers.jsonl (used for the
+  // dropdown label above) — attach it here so saveActiveForm can include it
+  // in the saved record. Previously this never made it past the dropdown,
+  // which is why the scorecard showed the raw episode_id instead of a
+  // clean number.
+  participantForm.episodeNumber = (ep && ep.episodeNumber != null) ? ep.episodeNumber : null;
   const epScores = computeScores(ITEMS_PARTICIPANT, participantForm.values);
   el.innerHTML = `
     ${scoreSummaryHtml(epScores.p0Pct, epScores.p1Pct, epScores.overall)}
@@ -1128,6 +1134,7 @@ async function saveActiveForm(){
     const payload = {
       sessionId: ingested.sessionId, scenarioId, episodeId, kind,
       roomLabel: (ingested.scenarios[scenarioId] || {}).roomLabel || null,
+      episodeNumber: form.episodeNumber != null ? form.episodeNumber : null,
       scores: form.values, notes: form.notes,
       p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
       savedAt: new Date().toISOString(),
