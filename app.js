@@ -25,8 +25,23 @@ const ITEMS_PARTICIPANT = [
   {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'scale', help:'Natural variation in movement speed.'},
   {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'scale', help:'Natural variation in near/far distance.'},
 ];
-const SCENARIO_ORDER = ['C0','T1-R1','T1-R2','T1-R3'];
 const MIN_GOOD_EPISODES = 10; // client threshold: a room needs at least this many PASSED episodes
+
+// A session can have any number of T1 rooms — not fixed at 3. These derive
+// the actual room list from whatever's been ingested so far (via capture.json
+// files' own scenarioId field), sorted by room number (T1-R1, T1-R2, ...).
+function getIngestedRoomIds(){
+  return Object.keys(ingested.scenarios)
+    .filter(id => /^T1-R\d+$/.test(id))
+    .sort((a,b) => parseInt(a.slice(4),10) - parseInt(b.slice(4),10));
+}
+// Full display order: C0 first (if ingested), then however many rooms exist.
+function getIngestedScenarioIds(){
+  const ids = [];
+  if (ingested.scenarios['C0']) ids.push('C0');
+  ids.push(...getIngestedRoomIds());
+  return ids;
+}
 
 /* ---------------------------------------------------------------
    Backend (Power Automate + SharePoint Excel). See docs/power-automate-spec.md.
@@ -263,7 +278,7 @@ async function handleFiles(fileList){
   }
   refreshSessionStatus();
   if (!currentScenarioId){
-    currentScenarioId = SCENARIO_ORDER.find(id => ingested.scenarios[id]) || null;
+    currentScenarioId = getIngestedScenarioIds()[0] || null;
   }
   renderScenarioTabs();
   renderScenarioShell();
@@ -273,9 +288,11 @@ async function handleFiles(fileList){
 function refreshSessionStatus(){
   const el = document.getElementById('sessionStatus');
   if (!ingested.sessionId){ el.textContent = 'No files loaded yet.'; return; }
-  const loadedScenarios = SCENARIO_ORDER.filter(id => ingested.scenarios[id]).length;
+  const hasC0 = !!ingested.scenarios['C0'];
+  const roomCount = getIngestedRoomIds().length;
+  const scenarioLabel = `${hasC0 ? 'C0' : 'no C0'}${roomCount ? ` + ${roomCount} room${roomCount === 1 ? '' : 's'}` : ''}`;
   const videoCount = Object.keys(ingested.videosByCapture).length;
-  el.innerHTML = `Session <span style="font-family:var(--font-mono)">${escapeHtml(ingested.sessionId)}</span> — ${loadedScenarios}/4 scenarios, ${videoCount} video(s) loaded`;
+  el.innerHTML = `Session <span style="font-family:var(--font-mono)">${escapeHtml(ingested.sessionId)}</span> — ${scenarioLabel} loaded, ${videoCount} video(s)`;
 }
 
 /* ---------------------------------------------------------------
@@ -600,9 +617,9 @@ async function computeC0Gate(){
 async function computeSessionSummary(){
   if (!ingested.sessionId) return null;
   const c0 = await computeC0Gate();
-  const rooms = await Promise.all(['T1-R1','T1-R2','T1-R3'].map(computeRoomGate));
-  const all = [c0, ...rooms];
-  const anyLoaded = ingested.sessionId && SCENARIO_ORDER.some(id => ingested.scenarios[id]);
+  const roomIds = getIngestedRoomIds();
+  const rooms = await Promise.all(roomIds.map(computeRoomGate));
+  const anyLoaded = getIngestedScenarioIds().length > 0;
   if (!anyLoaded) return null;
   const gates = [c0 ? c0.gatePass : null, ...rooms.map(r => r ? r.gatePass : null)];
   let sessionPass = 'incomplete';
@@ -611,7 +628,7 @@ async function computeSessionSummary(){
   const avgOf = arr => { const nums = arr.filter(v => v != null); return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null; };
   const sessionP0 = avgOf([c0 ? c0.p0Pct : null, ...rooms.map(r => r ? r.blendedP0Pct : null)]);
   const sessionP1 = avgOf(rooms.map(r => r ? r.blendedP1Pct : null)); // C0 has no P1 pool
-  return {sessionPass, sessionP0, sessionP1, c0, rooms};
+  return {sessionPass, sessionP0, sessionP1, c0, rooms, roomIds};
 }
 
 /* ---------------------------------------------------------------
@@ -636,18 +653,19 @@ function nearestTrackFrame(frames, targetSec){
 --------------------------------------------------------------- */
 function renderScenarioTabs(){
   const el = document.getElementById('scenarioTabs');
-  el.innerHTML = SCENARIO_ORDER.map(id => {
+  const ids = getIngestedScenarioIds();
+  if (!ids.length){
+    el.innerHTML = `<div class="empty-state" style="padding:10px 4px;">Drop capture files to see scenarios here.</div>`;
+    return;
+  }
+  el.innerHTML = ids.map(id => {
     const s = ingested.scenarios[id];
-    const disabled = !s ? 'disabled' : '';
     const active = id === currentScenarioId ? 'active' : '';
-    let flags = '';
-    if (s){
-      const hasVideo = !!ingested.videosByCapture[s.captureId];
-      const hasVideoZone = !!ingested.videoZoneByCapture[s.captureId];
-      const zoneFlag = id !== 'C0' ? (hasVideoZone ? ' · video-zone ✓' : ' · no zone data') : '';
-      flags = `<span class="flags">${hasVideo ? 'video ✓' : 'no video'}${zoneFlag}</span>`;
-    }
-    return `<button class="${active}" data-scenario="${id}" ${disabled}>${id}${s ? `<span class="room">${escapeHtml(s.roomLabel)}</span>${flags}` : ''}</button>`;
+    const hasVideo = !!ingested.videosByCapture[s.captureId];
+    const hasVideoZone = !!ingested.videoZoneByCapture[s.captureId];
+    const zoneFlag = id !== 'C0' ? (hasVideoZone ? ' · video-zone ✓' : ' · no zone data') : '';
+    const flags = `<span class="flags">${hasVideo ? 'video ✓' : 'no video'}${zoneFlag}</span>`;
+    return `<button class="${active}" data-scenario="${id}">${id}<span class="room">${escapeHtml(s.roomLabel)}</span>${flags}</button>`;
   }).join('');
   el.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -665,7 +683,8 @@ async function renderSessionBanner(){
   const el = document.getElementById('sessionBanner');
   const summary = await computeSessionSummary();
   if (!summary){ el.innerHTML = ''; return; }
-  const pillsHtml = [['C0', summary.c0], ['T1-R1', summary.rooms[0]], ['T1-R2', summary.rooms[1]], ['T1-R3', summary.rooms[2]]]
+  const pillPairs = [['C0', summary.c0], ...summary.roomIds.map((id, i) => [id, summary.rooms[i]])];
+  const pillsHtml = pillPairs
     .map(([label, g]) => {
       const state = !g ? 'incomplete' : (g.gatePass === true ? 'pass' : g.gatePass === false ? 'fail' : 'incomplete');
       return `<span class="gate-pill ${state}">${label}</span>`;
