@@ -14,16 +14,16 @@ const ITEMS_C0 = [
 // Useful Views is no longer a scored/averaged item here — it's the room-level
 // "at least MIN_GOOD_EPISODES passed episodes" gate instead (see computeRoomGate).
 const ITEMS_TECHNICAL = [
-  {id:'device_placements', label:'Device Placements', priority:'P0', kind:'scale', help:'At least 6 distinct camera positions covered in this room.'},
+  {id:'device_placements', label:'Device Placements', priority:'P0', kind:'percent', direction:'higher_is_better', referenceValue:6, unit:'positions', help:'Distinct camera positions covered in this room — 6 fully meets the minimum; measured directly (estimated) when available.'},
   {id:'audio_quality', label:'Audio Quality', priority:'P1', kind:'scale', help:'Clipping, noise floor, intelligibility.'},
   {id:'video_quality', label:'Video Quality', priority:'P1', kind:'scale', help:'Exposure, focus, framing, dropped frames.'},
 ];
 const ITEMS_PARTICIPANT = [
-  {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'scale', help:'Performer in continuous motion for >75% of the episode.'},
-  {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', help:'Time spent inside the 120°×5m forward FOV — measured directly from the video detector when available.'},
-  {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'scale', help:'Brief exits/re-entries outside FOV, staying near 2m, turning back before 3m.'},
-  {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'scale', help:'Natural variation in movement speed.'},
-  {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'scale', help:'Natural variation in near/far distance.'},
+  {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', unit:'%', help:'% of the episode spent in motion (target >75%) — measured directly from the radar/video detector when available.'},
+  {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', direction:'higher_is_better', unit:'%', help:'Time spent inside the 120°×5m forward FOV — measured directly from the video detector when available.'},
+  {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'percent', direction:'lower_is_better', unit:'%', help:'Time spent outside the FOV near 2–3m — measured directly when available. Lower is better (≤25% ≈ passing).'},
+  {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'percent', direction:'higher_is_better', referenceValue:5.0, unit:'m/s', help:'Natural variation in movement speed — more is better (not robotic/staged). Measured directly when available; ≥5.0 m/s ≈ passing.'},
+  {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'percent', direction:'higher_is_better', referenceValue:1.0, unit:'m', help:'Natural variation in near/far distance — more is better (not robotic/staged). Measured directly when available; ≥1.0m ≈ passing.'},
 ];
 const MIN_GOOD_EPISODES = 10; // client threshold: a room needs at least this many PASSED episodes
 
@@ -532,9 +532,29 @@ function docIdFor(d){
    (Blue Zone) sit in the same average as a manual 1-3 judgment
    without forcing the measurement through a lossy bucket first.
 --------------------------------------------------------------- */
+/* direction/referenceValue let a raw measurement (not just a 1-3 scale) map
+   correctly onto the shared 0-100 pooling scale, in whichever direction
+   actually means "good" for that item:
+   - no referenceValue, higher_is_better (default): raw IS the goodness
+     value already (e.g. Blue Zone % — more time there is just better).
+   - no referenceValue, lower_is_better: goodness = 100 - raw (only valid
+     for a naturally 0-100-bounded raw value, e.g. Orange Zone % — this
+     also means 100-raw>=75 is exactly raw<=25, so the existing P1
+     threshold IS the "≤25%" rule, no separate constant needed).
+   - referenceValue set: raw is an unbounded physical measurement (m/s,
+     meters, a count), so it's scaled against this item's OWN pass
+     threshold (85 for P0, 75 for P1) instead — goodness equals exactly
+     that threshold right at referenceValue, scaling up/down around it. */
 function toPct(it, v){
   if (v == null) return null;
-  return it.kind === 'percent' ? v : (v / 3 * 100);
+  if (it.kind !== 'percent') return v / 3 * 100; // unchanged: 1-3 manual scale
+  const dir = it.direction || 'higher_is_better';
+  if (it.referenceValue == null) return dir === 'lower_is_better' ? (100 - v) : v;
+  const threshold = it.priority === 'P0' ? 85 : 75;
+  const pct = dir === 'lower_is_better'
+    ? 100 - ((100 - threshold) / it.referenceValue) * v
+    : threshold * (v / it.referenceValue);
+  return Math.max(0, Math.min(100, pct));
 }
 
 function computeScores(items, values){
@@ -571,7 +591,7 @@ function blendedRoomQuality(technicalValues, participantDocs){
   };
   ITEMS_PARTICIPANT.forEach(it => {
     const raw = avgOf(it.id);
-    if (raw != null) (it.priority==='P0'?p0vals:p1vals).push(it.kind==='percent' ? raw : raw/3*100);
+    if (raw != null) (it.priority==='P0'?p0vals:p1vals).push(toPct(it, raw));
   });
   const avg = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
   return {p0Pct: avg(p0vals), p1Pct: avg(p1vals)};
@@ -718,7 +738,13 @@ function itemRowHtml(it, value, auto){
   if (it.kind === 'gate'){
     control = ['pass','fail'].map(v => `<button type="button" class="seg ${value===v?'active '+v:''}" data-item="${it.id}" data-value="${v}">${v==='pass'?'Pass':'Fail'}</button>`).join('');
   } else if (it.kind === 'percent'){
-    control = `<div class="percent-input"><input type="number" min="0" max="100" step="0.1" data-item="${it.id}" value="${value != null ? value : ''}" placeholder="0-100"><span>%</span></div>`;
+    // referenceValue items are raw physical measurements (m/s, meters, a
+    // position count), not a 0-100-bounded percentage — no upper cap, and
+    // label with the item's real unit instead of assuming "%".
+    const unit = it.unit || '%';
+    const maxAttr = it.referenceValue == null ? ' max="100"' : '';
+    const placeholder = it.referenceValue == null ? '0-100' : `e.g. ${it.referenceValue}`;
+    control = `<div class="percent-input"><input type="number" min="0"${maxAttr} step="0.1" data-item="${it.id}" value="${value != null ? value : ''}" placeholder="${placeholder}"><span>${escapeHtml(unit)}</span></div>`;
   } else {
     control = [1,2,3].map(n => `<button type="button" class="seg ${value===n?'active':''}" data-item="${it.id}" data-value="${n}">${n}</button>`).join('');
   }
