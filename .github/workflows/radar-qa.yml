@@ -1,0 +1,36 @@
+name: Radar QA extraction
+
+# Triggered by Power Automate via the GitHub API's repository_dispatch
+# endpoint, the moment a new inspection report lands in SharePoint.
+# Power Automate needs a repo-scoped Personal Access Token to call this --
+# that's a separate setup step on the Power Automate side, not something
+# this workflow file controls.
+"on":
+  repository_dispatch:
+    types: [inspection-report-ready]
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    # 20 min covers a single session comfortably based on real captures
+    # seen so far (largest ~15 min of raw audio/radar data processed in
+    # well under a minute) -- revisit if a session with many more rooms
+    # than we've tested against starts timing out.
+    timeout-minutes: 20
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install numpy
+
+      - name: Run radar QA extraction for this session
+        env:
+          RESULTS_WEBHOOK_URL: ${{ secrets.QA_RESULTS_WEBHOOK_URL }}
+          RESULTS_WEBHOOK_AUTH: ${{ secrets.QA_RESULTS_WEBHOOK_AUTH }}
+        run: python scripts/run_radar_qa.py
