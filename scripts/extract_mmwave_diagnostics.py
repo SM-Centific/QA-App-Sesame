@@ -249,6 +249,10 @@ def parse_args():
                         "--sync-json), every frame gets tagged with which episode it falls into, and a "
                         "per-episode breakdown (same metrics as the whole-capture summary, scoped to each "
                         "episode's actual time window) is written to <out>.episodes.json.")
+    p.add_argument("--moving-speed-threshold", type=float, default=0.3,
+                   help="implied speed (m/s) above which a frame counts as 'moving', for Continuous Movement "
+                        "(target: >75%% of tracked frames moving). Default 0.3 -- comfortably above sensor "
+                        "noise, comfortably below real walking pace.")
     p.add_argument("--position-window-s", type=float, default=2.0,
                    help="seconds of background_energy sampled at the tail of one episode and the head of the "
                         "next, compared to detect whether the scene's static background genuinely shifted "
@@ -316,13 +320,14 @@ def estimate_azimuth_deg(phase_diff_1_deg, phase_diff_2_deg, wavelength_m, anten
 
 def new_accumulator():
     return {
-        "total_frames": 0, "frames_tracked": 0, "frames_searching": 0,
+        "total_frames": 0, "frames_tracked": 0, "frames_searching": 0, "frames_moving": 0,
         "zone_counts": {"blue": 0, "orange": 0, "neither": 0},
         "tracked_ranges_m": [], "implied_speeds_mps": [], "first_lock": None,
     }
 
 
-def accumulate(acc, frame_idx, time_s, track_state, zone, peak_range_m, implied_speed_mps, azimuth=None):
+def accumulate(acc, frame_idx, time_s, track_state, zone, peak_range_m, implied_speed_mps, azimuth=None,
+               moving_threshold=0.3):
     acc["total_frames"] += 1
     if track_state == "searching":
         acc["frames_searching"] += 1
@@ -333,6 +338,11 @@ def accumulate(acc, frame_idx, time_s, track_state, zone, peak_range_m, implied_
         acc["zone_counts"][zone] += 1
     if implied_speed_mps is not None:
         acc["implied_speeds_mps"].append(implied_speed_mps)
+        # Conservative on purpose: a frame with no computed speed (the
+        # first frame of a fresh lock, where there's no prior position to
+        # diff against yet) does NOT count as moving, rather than guessing.
+        if implied_speed_mps > moving_threshold:
+            acc["frames_moving"] += 1
     if track_state == "acquired" and acc["first_lock"] is None:
         acc["first_lock"] = {
             "frame_index": frame_idx, "time_s": round(time_s, 3),
@@ -356,6 +366,10 @@ def summarize_accumulator(acc, extra_fields=None):
             "orange": round(100 * zc["orange"] / tracked_or_1, 1),
             "neither": round(100 * zc["neither"] / tracked_or_1, 1),
         },
+        # Measured against TRACKED frames only, same reasoning as
+        # pct_tracked elsewhere: a radar tracking gap isn't the
+        # participant's fault, so it shouldn't drag this down.
+        "continuous_movement_pct": round(100 * acc["frames_moving"] / tracked_or_1, 1) if acc["frames_tracked"] else None,
         "distance_variance_m": round(float(np.std(ranges)), 4) if ranges else None,
         "mean_range_m": round(float(np.mean(ranges)), 4) if ranges else None,
         "median_range_m": round(float(np.median(ranges)), 4) if ranges else None,
@@ -644,10 +658,12 @@ def main():
                 prev_was_locked = (track_state == "locked")
 
                 episode_window = find_episode_for_time(episode_windows, time_s) if episode_windows else None
-                accumulate(summary, frame_idx, time_s, track_state, zone, peak_range_m, implied_speed_mps, azimuth)
+                accumulate(summary, frame_idx, time_s, track_state, zone, peak_range_m, implied_speed_mps, azimuth,
+                           args.moving_speed_threshold)
                 if episode_window is not None:
                     accumulate(episode_accumulators[episode_window["episode_id"]],
-                               frame_idx, time_s, track_state, zone, peak_range_m, implied_speed_mps, azimuth)
+                               frame_idx, time_s, track_state, zone, peak_range_m, implied_speed_mps, azimuth,
+                               args.moving_speed_threshold)
                 buffer_position_energy(episode_window, time_s, background_energy,
                                         position_tail_energies, position_head_energies, args.position_window_s)
 
