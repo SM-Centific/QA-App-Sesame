@@ -100,14 +100,6 @@
   @media (max-width: 700px) { .video-row { grid-template-columns: 1fr; } }
   video { width: 100%; border-radius: 8px; background: #000; display: block; max-height: 440px; }
   .no-video { border: 1px dashed var(--border); border-radius: 8px; padding: 26px 12px; text-align: center; color: var(--muted); font-size: 12.5px; }
-  .zone-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
-  .zone-badge { font-family: var(--font-mono); font-size: 12.5px; padding: 4px 10px; border-radius: 5px; text-align: center; width: 100%; }
-  .zone-badge.blue { background: var(--blue-soft); color: var(--blue); }
-  .zone-badge.orange { background: var(--orange-soft); color: var(--orange); }
-  .zone-badge.warn { background: var(--warn-soft); color: var(--warn); }
-  .zone-badge.fail { background: var(--fail-soft); color: var(--fail); }
-  .zone-badge.muted { background: var(--panel-2); color: var(--muted); }
-  .zone-readout { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-align: center; }
   .episode-select-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .episode-select-row select { max-width: 300px; }
   .episode-info { font-family: var(--font-mono); font-size: 12px; color: var(--muted); }

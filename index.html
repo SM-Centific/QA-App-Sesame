@@ -42,16 +42,18 @@
       <h2>Begin review</h2>
       <div class="dropzone" id="reportDrop">
         Drop an inspection report (.csv) here, or click to browse.<br>
-        The app reads each room's files, runs the radar scripts, and fills the scores.
+        Each room row must include the raw <b>.mmwave.bin</b>, episode markers, and mmwave sync JSON.<br>
+        The radar script reads those .bin files and fills the scores.
         <input type="file" id="reportInput" accept=".csv,text/csv,.json,application/json">
       </div>
-      <div class="status-line" id="reviewStatus">Then check the suggested scores and press Save.</div>
+      <div class="status-line" id="reviewStatus">Nothing is scored until each room's .mmwave.bin has been read.</div>
     </div>
 
     <div class="panel">
       <h2>Or load files directly</h2>
       <div class="dropzone" id="dropzone">
-        Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json,<br>*.video_zone.jsonl, and capture video files here<br>— or click to browse
+        Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json, and capture video files here<br>— or click to browse.<br>
+        Radar scores still require each room's .mmwave.bin from the inspection report above.
         <input type="file" id="fileInput" multiple accept=".json,.jsonl,.mp4,.mov,.webm,video/*">
       </div>
       <div id="loadLog"></div>

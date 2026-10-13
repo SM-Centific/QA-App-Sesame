@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -83,6 +84,9 @@ def build_fixture(directory):
         "requiredMask": ["camera"],
     }))
     (directory / "P02_scenarioRunner_c003.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    (directory / "P02_scenarioRunner_c003.video_zone.jsonl").write_text(
+        json.dumps({"time_s": 0.2, "azimuth_deg": 10, "in_blue_zone": True}) + "\n"
+    )
 
 
 def report_csv(base):
@@ -96,6 +100,7 @@ def report_csv(base):
         ("", "session_validation.json", f"{base}/session_validation.json", "", ""),
         ("T1-R1", "T1-R1.audit.json", f"{base}/T1-R1.audit.json", "sv=test&sig=abc", ""),
         ("T1-R1", "P02_scenarioRunner_c003.mp4", "", "", f"{base}/P02_scenarioRunner_c003.mp4"),
+        ("T1-R1", "P02_scenarioRunner_c003.video_zone.jsonl", f"{base}/P02_scenarioRunner_c003.video_zone.jsonl", "", ""),
     ]
     lines = ["session_id,scenario_id,filename,blob_path,sas_token,video_preview_url"]
     for scenario, name, blob, token, preview in rows:
@@ -133,8 +138,15 @@ def assert_result(result):
     if movement.get("value") is None:
         raise SystemExit(f"continuous movement missing: {by_episode['ep-2']}")
     placements = (room.get("technical") or {}).get("device_placements") or {}
-    if placements.get("value") is None:
-        raise SystemExit(f"device placements missing: {room.get('technical')}")
+    if placements.get("value") is None or placements["value"] != int(placements["value"]):
+        raise SystemExit(f"device placements should be a whole number, got {room.get('technical')}")
+    bins = result.get("binsRead") or []
+    if len(bins) != 1 or not bins[0]["name"].endswith(".mmwave.bin") or not bins[0]["bytes"]:
+        raise SystemExit(f"bin was not recorded as read: {bins}")
+    if any(name.endswith("video_zone.jsonl") for name in names):
+        raise SystemExit(f"video zone log was forwarded: {sorted(names)}")
+    if not any("Radar scores come from this .bin" in line for line in result.get("log") or []):
+        raise SystemExit(f"log does not say the .bin was scored: {result.get('log')}")
     print("prepare_review ok")
     print(f"  blue_zone_pct={blue['value']} continuous_movement={movement['value']} device_placements={placements['value']}")
 
@@ -183,12 +195,30 @@ def main():
     with urllib.request.urlopen(request, timeout=120) as response:
         body = json.loads(response.read().decode())
     assert_result(body)
+    no_bin = "session_id,scenario_id,filename,blob_path\nenv-hello-session,T1-R1,P02_scenarioRunner_c003.capture.json," + base + "/P02_scenarioRunner_c003.capture.json\n"
+    no_bin_request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/review/start",
+        data=no_bin.encode(),
+        headers={"Content-Type": "text/plain", "X-Report-Name": "inspection-report.csv"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(no_bin_request, timeout=30)
+        raise SystemExit("a report with no .bin was accepted")
+    except urllib.error.HTTPError as exc:
+        payload = json.loads(exc.read().decode())
+        if exc.code != 400 or ".mmwave.bin" not in payload.get("error", ""):
+            raise SystemExit(f"missing-bin error was not explicit: {exc.code} {payload}")
     index = urllib.request.urlopen(f"http://127.0.0.1:{port}/index.html", timeout=10).read().decode()
-    if "Begin review" not in index or "reportInput" not in index:
-        raise SystemExit("index.html is not the updated review page")
+    if "Begin review" not in index or "reportInput" not in index or ".mmwave.bin" not in index:
+        raise SystemExit("index.html does not require the radar .bin")
+    if "video_zone" in index:
+        raise SystemExit("index.html still asks for a video-zone log")
     app = urllib.request.urlopen(f"http://127.0.0.1:{port}/app.js", timeout=10).read().decode()
-    if "beginReview" not in app:
-        raise SystemExit("app.js was not served from the repo")
+    if "beginReview" not in app or "unit === 'positions'" not in app or "integer ? '1'" not in app:
+        raise SystemExit("app.js does not step device placements by 1")
+    if "ingestVideoZone" in app or "computeBlueZoneAuto" in app:
+        raise SystemExit("video analyzer is still in app.js")
     if not ROOT.endswith("QA-App-Sesame") and not os.path.isdir(ROOT):
         raise SystemExit(f"unexpected root {ROOT}")
     print(f"HTTP review API ok on port {port}")

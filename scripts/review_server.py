@@ -269,9 +269,10 @@ def technical_from_summary(summary):
     placements = (summary or {}).get("device_placements") or None
     if not placements or placements.get("estimated_distinct_positions") is None:
         return {}
+    count = int(round(float(placements["estimated_distinct_positions"])))
     return {
         "device_placements": score_entry(
-            placements["estimated_distinct_positions"],
+            count,
             f"Radar estimate of distinct positions, routing {placements.get('routing')}",
         )
     }
@@ -350,11 +351,16 @@ def prepare_review(filename, raw):
                     dest = os.path.join(work_dir, os.path.basename(item["name"]))
                     size = download(item["url"], dest_path=dest, limit=BIN_LIMIT)
                     item["path"] = dest
-                    messages.append(f"Read {item['name']} ({size:,} bytes) for radar extraction.")
+                    item["size"] = size
+                    messages.append(f"Read {item['name']} ({size:,} bytes). Radar scores come from this .bin.")
                 else:
                     data = download(item["url"], limit=TEXT_LIMIT)
                     item["text"] = data.decode("utf-8-sig")
                     kind, parsed = sniff_text(item["name"], item["text"])
+                    if kind == "video_zone":
+                        messages.append(f"Ignored {item['name']}. Video-zone logs are not used. Scores come from each room's .mmwave.bin.")
+                        item["kind"] = "ignored"
+                        continue
                     item["kind"] = kind
                     item["parsed"] = parsed
                     if kind == "capture" and parsed:
@@ -403,27 +409,40 @@ def prepare_review(filename, raw):
             radar_out.append({
                 "scenarioId": scenario_id,
                 "status": "ok",
+                "bin": {"name": item["name"], "bytes": item.get("size")},
                 "technical": technical_from_summary(summary),
                 "episodes": episodes,
             })
-            messages.append(f"{scenario_id}: radar scores ready for {len(episodes)} episode(s).")
+            messages.append(f"{scenario_id}: scored from {item['name']} ({item.get('size')} bytes), {len(episodes)} episode(s).")
             try:
                 os.remove(item["path"])
             except OSError:
                 pass
 
+    read_bins = [item for item in downloaded if item["kind"] == "bin" and item.get("path") and not item.get("error")]
+    if not read_bins:
+        failed = [f"{item['name']}: {item.get('error') or 'not read'}" for item in downloaded if item["kind"] == "bin"]
+        detail = (" " + "; ".join(failed)) if failed else ""
+        raise ReportError(
+            "No radar .mmwave.bin was read, so the script did not score this session. "
+            "The inspection report must include each room's .mmwave.bin, episode markers, and mmwave sync JSON."
+            + detail
+        )
+
     for item in downloaded:
-        if item["kind"] in {"capture", "evidence", "validation", "audit", "markers", "video_zone"} and item.get("text"):
+        if item["kind"] in {"capture", "evidence", "validation", "audit", "markers"} and item.get("text"):
             files_out.append({"name": item["name"], "text": item["text"]})
 
     session_ids = [item["session_id"] for item in downloaded if item.get("session_id")]
-    if not radar_out and not files_out and not videos_out:
-        raise ReportError("No readable session files were found in the inspection report.")
     return {
         "sessionId": session_ids[0] if session_ids else None,
         "files": files_out,
         "videos": videos_out,
         "radar": radar_out,
+        "binsRead": [
+            {"name": item["name"], "bytes": item.get("size"), "scenarioId": item.get("scenario_id") or None}
+            for item in read_bins
+        ],
         "log": messages,
     }
 

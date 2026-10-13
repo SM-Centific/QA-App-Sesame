@@ -19,9 +19,9 @@ const ITEMS_TECHNICAL = [
   {id:'video_quality', label:'Video Quality', priority:'P1', kind:'scale', help:'Exposure, focus, framing, dropped frames.'},
 ];
 const ITEMS_PARTICIPANT = [
-  {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', unit:'%', help:'% of the episode spent in motion (target >75%) — measured directly from the radar/video detector when available.'},
-  {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', direction:'higher_is_better', unit:'%', help:'Time spent inside the 120°×5m forward FOV — measured directly from the video detector when available.'},
-  {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'percent', direction:'lower_is_better', unit:'%', help:'Time spent outside the FOV near 2–3m — measured directly when available. Lower is better (≤25% ≈ passing).'},
+  {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', unit:'%', help:'% of the episode spent in motion (target >75%) — measured from the room\'s radar .mmwave.bin when the inspection report includes it.'},
+  {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', direction:'higher_is_better', unit:'%', help:'Time spent inside the 120°×5m forward FOV — measured from the room\'s radar .mmwave.bin.'},
+  {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'percent', direction:'lower_is_better', unit:'%', help:'Time spent outside the FOV near 2–3m — measured from the room\'s radar .mmwave.bin. Lower is better (≤25% ≈ passing).'},
   {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'percent', direction:'higher_is_better', referenceValue:5.0, unit:'m/s', help:'Natural variation in movement speed — more is better (not robotic/staged). Measured directly when available; ≥5.0 m/s ≈ passing.'},
   {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'percent', direction:'higher_is_better', referenceValue:1.0, unit:'m', help:'Natural variation in near/far distance — more is better (not robotic/staged). Measured directly when available; ≥1.0m ≈ passing.'},
 ];
@@ -59,7 +59,6 @@ let currentUserRole = null;
 let ingested = {
   sessionId: null, scenarios: {}, evidenceByCapture: {}, validationByCapture: {},
   episodesByCapture: {}, auditByScenario: {}, videosByCapture: {},
-  videoZoneByCapture: {},
 };
 let currentScenarioId = null;
 let currentEpisodeId = null;
@@ -230,14 +229,6 @@ function ingestEpisodeMarkers(lines, filename){
   logLine(`<span class="tag ok">episode_markers</span> ${episodes.length} episodes for ${escapeHtml(captureId)}`);
 }
 
-function ingestVideoZone(lines, filename){
-  const captureId = deriveCaptureIdFromName(filename);
-  if (!captureId){ logLine(`<span class="tag warn">skip</span> ${escapeHtml(filename)} — couldn't detect capture id from filename for video-zone log`); return; }
-  ingested.videoZoneByCapture[captureId] = lines;
-  const detected = lines.filter(l => l.azimuth_deg != null).length;
-  logLine(`<span class="tag ok">video zone log</span> ${lines.length} samples (${detected} with a detection) for ${escapeHtml(captureId)}`);
-}
-
 function classifyAndIngest(filename, text){
   try {
     const obj = JSON.parse(text);
@@ -251,10 +242,13 @@ function classifyAndIngest(filename, text){
     if (!lines.length){ logLine(`<span class="tag warn">unrecognized</span> ${escapeHtml(filename)} (could not parse)`); return; }
     if (lines[0].type && String(lines[0].type).startsWith('capture.episode')){ ingestEpisodeMarkers(lines, filename); return; }
     if (lines[0].schemaVersion === 'hydra.mmwave-tracks/1' || (lines[0].frameIndex != null && 'tracks' in lines[0])){
-      logLine(`<span class="tag warn">skipped</span> ${escapeHtml(filename)} — mmWave tracks are no longer used (unreliable, and heavy on memory); drop a *.video_zone.jsonl instead`);
+      logLine(`<span class="tag warn">skipped</span> ${escapeHtml(filename)} — this is a tracks log, not the raw radar file. Scores come from the room's .mmwave.bin in the inspection report.`);
       return;
     }
-    if ('azimuth_deg' in lines[0] && 'in_blue_zone' in lines[0]){ ingestVideoZone(lines, filename); return; }
+    if ('azimuth_deg' in lines[0] && 'in_blue_zone' in lines[0]){
+      logLine(`<span class="tag warn">skipped</span> ${escapeHtml(filename)} — video-zone logs are not used. Scores come from each room's .mmwave.bin.`);
+      return;
+    }
     logLine(`<span class="tag warn">unrecognized</span> ${escapeHtml(filename)} (JSONL, unknown shape)`);
   }
 }
@@ -340,39 +334,11 @@ function computeScenarioAutos(scenarioId, items){
   if (autos.device_placements){
     const hit = radarByScenario[scenarioId] && radarByScenario[scenarioId].technical && radarByScenario[scenarioId].technical.device_placements;
     if (hit && hit.value != null){
-      autos.device_placements.value = hit.value;
+      autos.device_placements.value = Math.round(hit.value);
       autos.device_placements.note = hit.note;
     }
   }
   return autos;
-}
-
-// Episode-scoped auto: Blue Zone % computed from the video-zone log, filtered
-// to this specific episode's time window. Also returns a coverage figure
-// (fraction of sampled frames that actually had a detection) so the reviewer
-// can see how much to trust the number, not just the number itself.
-function computeBlueZoneAuto(scenarioId, episode){
-  const scenario = ingested.scenarios[scenarioId];
-  const captureId = scenario && scenario.captureId;
-  const videoZone = captureId ? ingested.videoZoneByCapture[captureId] : null;
-  if (!videoZone || !episode || episode.startElapsedMs == null || episode.durationMs == null){
-    return {value: null, note: 'No video-zone log loaded for this capture.', coveragePct: null};
-  }
-  const startSec = episode.startElapsedMs / 1000;
-  const endSec = (episode.startElapsedMs + episode.durationMs) / 1000;
-  const inWindow = videoZone.filter(f => f.time_s >= startSec && f.time_s <= endSec);
-  if (!inWindow.length) return {value: null, note: 'No video-zone samples fall inside this episode\'s time window.', coveragePct: null};
-  const detected = inWindow.filter(f => f.azimuth_deg != null);
-  const inBlue = detected.filter(f => f.in_blue_zone);
-  const coveragePct = detected.length / inWindow.length * 100;
-  const bluePct = detected.length ? (inBlue.length / detected.length * 100) : null;
-  return {
-    value: bluePct != null ? Math.round(bluePct * 10) / 10 : null,
-    note: bluePct != null
-      ? `${inWindow.length} samples in window, detected in ${coveragePct.toFixed(0)}%`
-      : 'No detections landed inside this episode\'s window.',
-    coveragePct,
-  };
 }
 
 function computeParticipantAutos(scenarioId, episode){
@@ -387,8 +353,9 @@ function computeParticipantAutos(scenarioId, episode){
       if (hit && hit.value != null) autos[it.id] = hit;
     });
   }
-  if (autos.blue_zone_pct.value == null) autos.blue_zone_pct = computeBlueZoneAuto(scenarioId, episode);
-  else if (!autos.blue_zone_pct.note) autos.blue_zone_pct.note = 'Filled from radar extraction.';
+  if (autos.blue_zone_pct.value == null){
+    autos.blue_zone_pct.note = 'No radar score yet. The inspection report must include this room\'s .mmwave.bin.';
+  }
   return autos;
 }
 
@@ -686,20 +653,6 @@ async function computeSessionSummary(){
 /* ---------------------------------------------------------------
    Zone classification
 --------------------------------------------------------------- */
-function classifyZoneVideo(sample){
-  if (!sample || sample.azimuth_deg == null) return {label: 'No detection', cls: 'muted'};
-  return sample.in_blue_zone ? {label: 'Blue zone', cls: 'blue'} : {label: 'Outside blue zone', cls: 'warn'};
-}
-function nearestTrackFrame(frames, targetSec){
-  let lo = 0, hi = frames.length - 1;
-  if (!frames.length) return null;
-  while (lo < hi){
-    const mid = (lo + hi) >> 1;
-    if (frames[mid].__t < targetSec) lo = mid + 1; else hi = mid;
-  }
-  return frames[lo];
-}
-
 /* ---------------------------------------------------------------
    Rendering: rail
 --------------------------------------------------------------- */
@@ -714,9 +667,9 @@ function renderScenarioTabs(){
     const s = ingested.scenarios[id];
     const active = id === currentScenarioId ? 'active' : '';
     const hasVideo = !!ingested.videosByCapture[s.captureId];
-    const hasVideoZone = !!ingested.videoZoneByCapture[s.captureId];
-    const zoneFlag = id !== 'C0' ? (hasVideoZone ? ' · video-zone ✓' : ' · no zone data') : '';
-    const flags = `<span class="flags">${hasVideo ? 'video ✓' : 'no video'}${zoneFlag}</span>`;
+    const radar = radarByScenario[id];
+    const binFlag = id !== 'C0' ? (radar && radar.bin ? ' · .bin ✓' : ' · no .bin') : '';
+    const flags = `<span class="flags">${hasVideo ? 'video ✓' : 'no video'}${binFlag}</span>`;
     return `<button class="${active}" data-scenario="${id}">${id}<span class="room">${escapeHtml(s.roomLabel)}</span>${flags}</button>`;
   }).join('');
   el.querySelectorAll('button').forEach(btn => {
@@ -774,9 +727,12 @@ function itemRowHtml(it, value, auto){
     // position count), not a 0-100-bounded percentage — no upper cap, and
     // label with the item's real unit instead of assuming "%".
     const unit = it.unit || '%';
+    const integer = unit === 'positions';
     const maxAttr = it.referenceValue == null ? ' max="100"' : '';
     const placeholder = it.referenceValue == null ? '0-100' : `e.g. ${it.referenceValue}`;
-    control = `<div class="percent-input"><input type="number" min="0"${maxAttr} step="0.1" data-item="${it.id}" value="${value != null ? value : ''}" placeholder="${placeholder}"><span>${escapeHtml(unit)}</span></div>`;
+    const step = integer ? '1' : '0.1';
+    const shown = value == null || value === '' ? '' : (integer ? String(Math.round(Number(value))) : value);
+    control = `<div class="percent-input"><input type="number" min="0"${maxAttr} step="${step}" data-item="${it.id}" value="${shown}" placeholder="${placeholder}"><span>${escapeHtml(unit)}</span></div>`;
   } else {
     control = [1,2,3].map(n => `<button type="button" class="seg ${value===n?'active':''}" data-item="${it.id}" data-value="${n}">${n}</button>`).join('');
   }
@@ -846,26 +802,12 @@ async function renderScenarioShell(){
   const video = ingested.videosByCapture[scenario.captureId];
   activateVideo(video); // lazily create this one's blob URL, releasing whichever other one was active
   const audit = ingested.auditByScenario[currentScenarioId];
-  const videoZone = ingested.videoZoneByCapture[scenario.captureId];
-  const zoneSource = videoZone ? 'video' : null;
   const isC0 = currentScenarioId === 'C0';
 
   const auditLine = audit ? `<div class="audit-line">Devices required: ${escapeHtml(audit.expectedDevices.join(', '))}</div>` : '';
   const videoHtml = video && video.url
     ? `<video id="capVideo" controls preload="metadata" src="${escapeHtml(video.url)}"></video>`
     : `<div class="no-video">No video uploaded for ${escapeHtml(scenario.captureId)} yet.</div>`;
-  const zoneHtml = (zoneSource && video)
-    ? `<div class="zone-panel">
-         <svg viewBox="0 0 160 130" width="100%" style="max-width:160px;">
-           <path d="M 80 110 L 20 20 A 90 90 0 0 1 140 20 Z" fill="var(--panel-2)" stroke="var(--border)"/>
-           <circle cx="80" cy="110" r="4" fill="var(--muted)"/>
-           <circle id="zoneDot" cx="80" cy="110" r="5" fill="var(--accent)"/>
-         </svg>
-         <div class="zone-badge muted" id="zoneBadge">No lock</div>
-         <div class="zone-readout" id="zoneReadout">–</div>
-         <div class="zone-readout" style="opacity:.7">source: video detection</div>
-       </div>`
-    : '';
 
   const episodeSelectHtml = episodes.length ? `
     <div class="episode-select-row">
@@ -894,7 +836,6 @@ async function renderScenarioShell(){
     <div class="workspace">
       <div class="video-col">
         ${videoHtml}
-        ${zoneHtml}
         ${episodeSelectHtml}
         <div class="annotation-panel" id="annotationPanel">
           <div class="panel-title">Video annotations <span id="annotationCount"></span></div>
@@ -996,30 +937,6 @@ async function renderScenarioShell(){
     const commentBtn = document.getElementById('addCommentBtn');
     if (flagBtn) flagBtn.addEventListener('click', () => openAnnotationForm('flag'));
     if (commentBtn) commentBtn.addEventListener('click', () => openAnnotationForm('comment'));
-  }
-
-  if (zoneSource === 'video' && video && videoEl){
-    const frames = videoZone.map(f => ({ ...f, __t: f.time_s })).sort((a,b) => a.__t - b.__t);
-    let lastUpdate = 0;
-    videoEl.addEventListener('timeupdate', () => {
-      const now = performance.now();
-      if (now - lastUpdate < 200) return;
-      lastUpdate = now;
-      const sample = nearestTrackFrame(frames, videoEl.currentTime);
-      const zone = classifyZoneVideo(sample);
-      const badge = document.getElementById('zoneBadge');
-      const readout = document.getElementById('zoneReadout');
-      const dot = document.getElementById('zoneDot');
-      if (badge){ badge.className = 'zone-badge ' + zone.cls; badge.textContent = zone.label; }
-      if (readout) readout.textContent = (sample && sample.azimuth_deg != null) ? `${sample.azimuth_deg.toFixed(0)}°${sample.score!=null?` (score ${sample.score.toFixed(2)})`:''}` : '–';
-      if (dot && sample && sample.azimuth_deg != null){
-        const rad = sample.azimuth_deg * Math.PI / 180;
-        const cx = 80 + 55 * Math.sin(rad);
-        const cy = 110 - 55 * Math.cos(rad);
-        dot.setAttribute('cx', Math.max(5, Math.min(155, cx)));
-        dot.setAttribute('cy', Math.max(10, Math.min(125, cy)));
-      }
-    });
   }
 
   renderScoringSection();
@@ -1146,8 +1063,11 @@ function wireItemInputs(containerId, docId, items, kind, scenarioId, episodeId){
       const itemId = inp.dataset.item;
       if (!formCache[docId]) return;
       captureVisibleNotes(docId, kind);
-      let v = inp.value === '' ? null : parseFloat(inp.value);
-      if (v != null) v = Math.max(0, Math.min(100, v));
+      const item = items.find(it => it.id === itemId);
+      const integer = item && item.unit === 'positions';
+      let v = inp.value === '' ? null : (integer ? parseInt(inp.value, 10) : parseFloat(inp.value));
+      if (v != null && Number.isNaN(v)) v = null;
+      if (v != null) v = integer ? Math.max(0, Math.round(v)) : Math.max(0, Math.min(100, v));
       formCache[docId].values[itemId] = v;
       renderScoringSection();
     });
@@ -1232,7 +1152,7 @@ function resetIngested(){
   releaseActiveVideo();
   ingested = {
     sessionId: null, scenarios: {}, evidenceByCapture: {}, validationByCapture: {},
-    episodesByCapture: {}, auditByScenario: {}, videosByCapture: {}, videoZoneByCapture: {},
+    episodesByCapture: {}, auditByScenario: {}, videosByCapture: {},
   };
   currentScenarioId = null;
   currentEpisodeId = null;
@@ -1251,7 +1171,7 @@ function indexRadar(rooms){
     if (!room || !room.scenarioId) return;
     const episodes = {};
     (room.episodes || []).forEach(ep => { if (ep && ep.episodeId) episodes[ep.episodeId] = ep.scores || {}; });
-    out[room.scenarioId] = {technical: room.technical || {}, episodes, status: room.status, error: room.error};
+    out[room.scenarioId] = {technical: room.technical || {}, episodes, status: room.status, error: room.error, bin: room.bin || null};
   });
   return out;
 }
@@ -1306,10 +1226,11 @@ async function beginReview(file){
     renderScenarioTabs();
     renderScenarioShell();
     renderSessionBanner();
-    const ready = (data.radar || []).filter(room => room.status === 'ok').length;
-    if (status) status.textContent = ready
-      ? `Radar scoring finished for ${ready} room${ready === 1 ? '' : 's'}. Check the suggested scores, then Save.`
-      : 'Session files are loaded. No radar scores were produced. Review what is there, then Save.';
+    const bins = data.binsRead || [];
+    const listed = bins.map(bin => `${bin.name} (${Number(bin.bytes).toLocaleString()} bytes)`).join('; ');
+    if (status) status.textContent = listed
+      ? `Read ${listed}. Radar scores were filled from those .bin files. Check them, then Save.`
+      : 'No .mmwave.bin was read, so the radar script did not score this session.';
   } catch (err){
     if (status) status.textContent = 'The review server is not running, so the radar scripts did not run. Start python3 scripts/review_server.py and upload the report again.';
   } finally {

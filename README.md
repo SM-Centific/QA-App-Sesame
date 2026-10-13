@@ -1,6 +1,6 @@
 # QA-App-Sesame
 
-QA scoring and review tool for Sesame capture sessions — scores C0/T1 episodes against calibration and participant metrics, with automated checks from capture metadata and video-based zone detection.
+QA scoring and review tool for Sesame capture sessions — scores C0/T1 episodes against calibration and participant metrics. Radar scores come from each room's raw `.mmwave.bin`.
 
 **Live app:** https://sm-centific.github.io/QA-App-Sesame/
 
@@ -20,7 +20,7 @@ Load a session's capture files (JSON/JSONL metadata + the capture videos) and sc
 ### Automated pre-fills (all reviewer-overridable)
 - **Sync Chirp** — pass/fail from `session_evidence.json`
 - **Audio/Video Quality** — flagged from `session_validation.json`'s integrity issues
-- **Blue Zone %** — computed directly from a video-zone detection log (see below), windowed to each episode's actual time range, with a detector-confidence figure shown alongside it
+- **Radar scores** — continuous movement, blue zone, orange zone, speed variance, distance variance, and device placements are filled from each room's `.mmwave.bin` when an inspection report is uploaded. The report must list that `.bin` plus the episode markers and mmwave sync JSON. Video-zone logs are not used.
 
 ## Files the app reads
 
@@ -33,8 +33,8 @@ Drop these in (any order, any filename — content is auto-classified):
 | `episode_markers.jsonl` | per capture (×4) | episode list, durations, retained/passed status |
 | `session_evidence.json` | per session | Sync Chirp auto-verdict |
 | `session_validation.json` | per session | Audio/Video Quality auto-flags |
-| capture video (`.mp4`) | per capture | the player itself |
-| `*.video_zone.jsonl` | per capture (T1 only) | Blue Zone % auto-fill — see `extract_video_zone.py` |
+| capture video (`.mp4`) | per capture | the player itself, for watching the capture while reviewing |
+| `.mmwave.bin` | per room, required in the inspection report | the file the radar script reads to fill scores |
 
 
 ## Scoring model
@@ -62,7 +62,6 @@ docs/
   power-automate-expression-notes.md  — syntax gotchas learned building the flows (worth reading before touching them)
 ```
 
-## Companion tools (not part of this repo, run locally)
+## Radar scoring
 
-- `extract_video_zone.py` — runs person detection on a capture's ERP video, outputs the `*.video_zone.jsonl` log this app ingests for Blue Zone %.
-- `extract_mmwave_diagnostics.py` — raw mmWave `.bin` → range/velocity/phase diagnostics. Kept for reference from an earlier investigation into radar-based zone detection; the app itself no longer ingests mmWave tracks at all (dropped — unreliable, and heavy on memory for large sessions), superseded entirely by the video-based detector.
+Upload an inspection report from **Begin review**. The review server (`python3 scripts/review_server.py`) downloads each room's `.mmwave.bin`, episode markers, and mmwave sync JSON, then runs `scripts/extract_mmwave_diagnostics.py`. Scores are suggestions the reviewer can change before Save. A report with no `.mmwave.bin` is rejected, because there is nothing for the script to score.
