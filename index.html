@@ -52,9 +52,9 @@
     <div class="panel">
       <h2>Or load files directly</h2>
       <div class="dropzone" id="dropzone">
-        Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json, and capture video files here<br>— or click to browse.<br>
-        Radar scores still require each room's .mmwave.bin from the inspection report above.
-        <input type="file" id="fileInput" multiple accept=".json,.jsonl,.mp4,.mov,.webm,video/*">
+        Drop each room's <b>.mmwave.bin</b> in the same selection as its episode markers,<br>mmwave sync JSON, and capture.json. A capture id or room id in the filename<br>(c003, T1-R1) matches those files to the room.<br>
+        The .bin is streamed to disk and scored there. It is not loaded into browser memory.
+        <input type="file" id="fileInput" multiple accept=".bin,.json,.jsonl,.mp4,.mov,.webm,video/*">
       </div>
       <div id="loadLog"></div>
       <div class="status-line" id="sessionStatus">No files loaded yet.</div>
