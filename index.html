@@ -39,7 +39,17 @@
 <div class="layout">
   <div class="rail">
     <div class="panel">
-      <h2>Load session files &amp; videos</h2>
+      <h2>Begin review</h2>
+      <div class="dropzone" id="reportDrop">
+        Drop an inspection report (.csv) here, or click to browse.<br>
+        The app reads each room's files, runs the radar scripts, and fills the scores.
+        <input type="file" id="reportInput" accept=".csv,text/csv,.json,application/json">
+      </div>
+      <div class="status-line" id="reviewStatus">Then check the suggested scores and press Save.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Or load files directly</h2>
       <div class="dropzone" id="dropzone">
         Drop capture.json, audit.json, episode_markers.jsonl,<br>session_evidence.json, session_validation.json,<br>*.video_zone.jsonl, and capture video files here<br>— or click to browse
         <input type="file" id="fileInput" multiple accept=".json,.jsonl,.mp4,.mov,.webm,video/*">
@@ -71,7 +81,7 @@
 
   <main>
     <div id="sessionBanner"></div>
-    <div id="scenarioShell"><div class="empty-state">Load session files, then choose a scenario to begin scoring.</div></div>
+    <div id="scenarioShell"><div class="empty-state">Upload an inspection report, then choose a scenario to review the scores.</div></div>
   </main>
 </div>
 

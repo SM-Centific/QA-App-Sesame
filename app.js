@@ -71,6 +71,7 @@ let localScores = {};
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
 let activeVideoObj = null; // whichever videosByCapture entry currently holds a live blob URL, if any
+let radarByScenario = {}; // scenarioId -> {technical: {itemId: {value, note}}, episodes: {episodeId: {itemId: {value, note}}}}
 
 function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function logLine(html){ const el = document.getElementById('loadLog'); const d = document.createElement('div'); d.innerHTML = html; el.appendChild(d); el.scrollTop = el.scrollHeight; }
@@ -258,6 +259,13 @@ function classifyAndIngest(filename, text){
   }
 }
 
+function ingestRemoteVideo(name, url){
+  const captureId = deriveCaptureIdFromName(name) || deriveCaptureIdFromName(url);
+  if (!captureId){ logLine(`<span class="tag warn">skip</span> ${escapeHtml(name)} — couldn't detect capture id from filename`); return; }
+  ingested.videosByCapture[captureId] = { name, file: null, url: null, remoteUrl: url };
+  logLine(`<span class="tag ok">video</span> ${escapeHtml(name)} → ${escapeHtml(captureId)}`);
+}
+
 function ingestVideo(file){
   const captureId = deriveCaptureIdFromName(file.name);
   if (!captureId){ logLine(`<span class="tag warn">skip</span> ${escapeHtml(file.name)} — couldn't detect capture id from filename`); return; }
@@ -329,6 +337,13 @@ function computeScenarioAutos(scenarioId, items){
       }
     } else { autos[id].note = 'No session_validation loaded for this capture.'; }
   });
+  if (autos.device_placements){
+    const hit = radarByScenario[scenarioId] && radarByScenario[scenarioId].technical && radarByScenario[scenarioId].technical.device_placements;
+    if (hit && hit.value != null){
+      autos.device_placements.value = hit.value;
+      autos.device_placements.note = hit.note;
+    }
+  }
   return autos;
 }
 
@@ -358,6 +373,23 @@ function computeBlueZoneAuto(scenarioId, episode){
       : 'No detections landed inside this episode\'s window.',
     coveragePct,
   };
+}
+
+function computeParticipantAutos(scenarioId, episode){
+  const autos = {};
+  ITEMS_PARTICIPANT.forEach(it => { autos[it.id] = {value: null, note: null}; });
+  const episodeScores = radarByScenario[scenarioId] && radarByScenario[scenarioId].episodes && episode
+    ? radarByScenario[scenarioId].episodes[episode.episodeId]
+    : null;
+  if (episodeScores){
+    ITEMS_PARTICIPANT.forEach(it => {
+      const hit = episodeScores[it.id];
+      if (hit && hit.value != null) autos[it.id] = hit;
+    });
+  }
+  if (autos.blue_zone_pct.value == null) autos.blue_zone_pct = computeBlueZoneAuto(scenarioId, episode);
+  else if (!autos.blue_zone_pct.note) autos.blue_zone_pct.note = 'Filled from radar extraction.';
+  return autos;
 }
 
 /* ---------------------------------------------------------------
@@ -785,6 +817,10 @@ function releaseActiveVideo(){
 function activateVideo(video){
   if (activeVideoObj === video) return; // same one already active — don't recreate/reset playback
   releaseActiveVideo();
+  if (video && video.remoteUrl){
+    video.url = video.remoteUrl;
+    return;
+  }
   if (video && video.file){
     video.url = URL.createObjectURL(video.file);
     activeVideoObj = video;
@@ -815,8 +851,8 @@ async function renderScenarioShell(){
   const isC0 = currentScenarioId === 'C0';
 
   const auditLine = audit ? `<div class="audit-line">Devices required: ${escapeHtml(audit.expectedDevices.join(', '))}</div>` : '';
-  const videoHtml = video
-    ? `<video id="capVideo" controls preload="metadata" src="${video.url}"></video>`
+  const videoHtml = video && video.url
+    ? `<video id="capVideo" controls preload="metadata" src="${escapeHtml(video.url)}"></video>`
     : `<div class="no-video">No video uploaded for ${escapeHtml(scenario.captureId)} yet.</div>`;
   const zoneHtml = (zoneSource && video)
     ? `<div class="zone-panel">
@@ -1051,8 +1087,7 @@ async function renderScoringSection(){
   }
   const ep = episodes.find(e => e.episodeId === currentEpisodeId);
   const epDocId = `${ingested.sessionId}__${currentScenarioId}__ep__${currentEpisodeId}`;
-  const blueAuto = computeBlueZoneAuto(currentScenarioId, ep);
-  const autos = { blue_zone_pct: blueAuto };
+  const autos = computeParticipantAutos(currentScenarioId, ep);
   const participantForm = await ensureFormLoaded(epDocId, ITEMS_PARTICIPANT, 'participant', currentScenarioId, currentEpisodeId, autos);
   // episodeNumber is already known from episode_markers.jsonl (used for the
   // dropdown label above) — attach it here so saveActiveForm can include it
@@ -1193,6 +1228,105 @@ async function renderSavedList(){
 /* ---------------------------------------------------------------
    Wiring
 --------------------------------------------------------------- */
+function resetIngested(){
+  releaseActiveVideo();
+  ingested = {
+    sessionId: null, scenarios: {}, evidenceByCapture: {}, validationByCapture: {},
+    episodesByCapture: {}, auditByScenario: {}, videosByCapture: {}, videoZoneByCapture: {},
+  };
+  currentScenarioId = null;
+  currentEpisodeId = null;
+  currentScope = 'technical';
+  formCache = {};
+  annotationsCache = {};
+  activeForm = null;
+  radarByScenario = {};
+  const log = document.getElementById('loadLog');
+  if (log) log.innerHTML = '';
+}
+
+function indexRadar(rooms){
+  const out = {};
+  (rooms || []).forEach(room => {
+    if (!room || !room.scenarioId) return;
+    const episodes = {};
+    (room.episodes || []).forEach(ep => { if (ep && ep.episodeId) episodes[ep.episodeId] = ep.scores || {}; });
+    out[room.scenarioId] = {technical: room.technical || {}, episodes, status: room.status, error: room.error};
+  });
+  return out;
+}
+
+async function seedAllForms(){
+  if (!ingested.sessionId) return;
+  if (ingested.scenarios['C0']){
+    const docId = `${ingested.sessionId}__C0__form`;
+    await ensureFormLoaded(docId, ITEMS_C0, 'c0', 'C0', null, computeScenarioAutos('C0', ITEMS_C0));
+  }
+  for (const scenarioId of getIngestedRoomIds()){
+    const techDocId = `${ingested.sessionId}__${scenarioId}__technical`;
+    await ensureFormLoaded(techDocId, ITEMS_TECHNICAL, 'technical', scenarioId, null, computeScenarioAutos(scenarioId, ITEMS_TECHNICAL));
+    const scenario = ingested.scenarios[scenarioId];
+    const episodes = ingested.episodesByCapture[scenario.captureId] || [];
+    for (const ep of episodes){
+      const epDocId = `${ingested.sessionId}__${scenarioId}__ep__${ep.episodeId}`;
+      const form = await ensureFormLoaded(epDocId, ITEMS_PARTICIPANT, 'participant', scenarioId, ep.episodeId, computeParticipantAutos(scenarioId, ep));
+      form.episodeNumber = ep.episodeNumber != null ? ep.episodeNumber : null;
+    }
+  }
+}
+
+async function beginReview(file){
+  const status = document.getElementById('reviewStatus');
+  const drop = document.getElementById('reportDrop');
+  if (status) status.textContent = 'Reading the inspection report and running radar scoring…';
+  if (drop) drop.classList.add('busy');
+  try {
+    const res = await fetch('/api/review/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'text/plain; charset=utf-8', 'X-Report-Name': file.name},
+      body: await file.text(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok){
+      if (status) status.textContent = data.error || 'The inspection report could not be processed.';
+      return;
+    }
+    resetIngested();
+    radarByScenario = indexRadar(data.radar);
+    (data.files || []).forEach(f => classifyAndIngest(f.name, f.text));
+    (data.videos || []).forEach(v => ingestRemoteVideo(v.name, v.url));
+    (data.log || []).forEach(line => logLine(`<span class="tag ok">report</span> ${escapeHtml(line)}`));
+    (data.radar || []).filter(room => room.status === 'error').forEach(room => {
+      logLine(`<span class="tag warn">radar</span> ${escapeHtml(room.scenarioId)}: ${escapeHtml(room.error || 'extraction failed')}`);
+    });
+    if (!ingested.sessionId && data.sessionId) ingested.sessionId = data.sessionId;
+    currentScenarioId = getIngestedScenarioIds()[0] || null;
+    await seedAllForms();
+    refreshSessionStatus();
+    renderScenarioTabs();
+    renderScenarioShell();
+    renderSessionBanner();
+    const ready = (data.radar || []).filter(room => room.status === 'ok').length;
+    if (status) status.textContent = ready
+      ? `Radar scoring finished for ${ready} room${ready === 1 ? '' : 's'}. Check the suggested scores, then Save.`
+      : 'Session files are loaded. No radar scores were produced. Review what is there, then Save.';
+  } catch (err){
+    if (status) status.textContent = 'The review server is not running, so the radar scripts did not run. Start python3 scripts/review_server.py and upload the report again.';
+  } finally {
+    if (drop) drop.classList.remove('busy');
+  }
+}
+
+const reportDrop = document.getElementById('reportDrop');
+const reportInput = document.getElementById('reportInput');
+if (reportDrop && reportInput){
+  reportDrop.addEventListener('click', () => { if (!reportDrop.classList.contains('busy')) reportInput.click(); });
+  reportInput.addEventListener('change', e => { if (e.target.files.length) beginReview(e.target.files[0]); reportInput.value = ''; });
+  ['dragenter','dragover'].forEach(evt => reportDrop.addEventListener(evt, e => { e.preventDefault(); reportDrop.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(evt => reportDrop.addEventListener(evt, e => { e.preventDefault(); reportDrop.classList.remove('drag'); }));
+  reportDrop.addEventListener('drop', e => { if (e.dataTransfer.files.length && !reportDrop.classList.contains('busy')) beginReview(e.dataTransfer.files[0]); });
+}
+
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('fileInput');
 dropzone.addEventListener('click', () => fileInput.click());
