@@ -86,6 +86,11 @@ let formCache = {};
 let annotationsCache = {}; // scenarioId -> array of {id, type, timeSec, text, createdAt}
 let activeForm = null;   // {docId, items, kind, scenarioId, episodeId} for whichever form is currently on screen — lets the single global Save button know what to save
 let localScores = {};
+// Set by "Reset scores to radar": while it names the loaded session, saved
+// score values for that session are ignored when forms are built, so the
+// radar / automatic suggestions show instead. Saved notes are kept. Cleared
+// whenever a session is (re)loaded.
+let ignoreSavedScoresFor = null;
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
 let activeVideoObj = null; // whichever videosByCapture entry currently holds a live blob URL, if any
@@ -951,7 +956,10 @@ function itemRowHtml(it, value, auto){
 
 async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId, autos){
   if (formCache[docId]) return formCache[docId];
-  const saved = await loadDoc(docId);
+  const stored = await loadDoc(docId);
+  const resetting = ignoreSavedScoresFor && ingested.sessionId === ignoreSavedScoresFor;
+  // On a reset, keep the saved notes but drop the saved score values.
+  const saved = (resetting && stored) ? {notes: stored.notes, savedAt: stored.savedAt} : stored;
   const values = {};
   const legacy = saved && saved.scores && !(saved.scoreVersion >= SCORE_VERSION);
   items.forEach(it => {
@@ -1336,6 +1344,7 @@ function setSaveStatus(state, savedAt){
   if (!el) return;
   if (state === 'saving') el.textContent = 'Saving…';
   else if (state === 'saved') el.textContent = 'Saved ' + new Date(savedAt).toLocaleTimeString();
+  else if (state === 'dirty') el.textContent = 'Reset to radar — not saved yet';
 }
 
 // Saves EVERY form currently sitting in formCache — every episode and
@@ -1372,6 +1381,9 @@ async function saveActiveForm(){
     count++;
   }
   setSaveStatus('saved', new Date().toISOString());
+  // A reset has now been written over the old rows; from here on the saved
+  // copies are the reset values, so stop ignoring them.
+  ignoreSavedScoresFor = null;
   renderSavedList();
   renderSessionBanner();
   renderScoringSection();
@@ -1408,6 +1420,7 @@ function resetIngested(){
   annotationsCache = {};
   activeForm = null;
   radarByScenario = {};
+  ignoreSavedScoresFor = null;
   const log = document.getElementById('loadLog');
   if (log) log.innerHTML = '';
 }
@@ -1574,6 +1587,31 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 
 document.getElementById('globalSaveBtn').addEventListener('click', async () => {
   await saveActiveForm();
+});
+
+document.getElementById('resetToRadarBtn').addEventListener('click', async () => {
+  if (!ingested.sessionId){ logLine(`<span class="tag warn">reset</span> no session loaded yet`); return; }
+  const ok = confirm(
+    `Reset every score for session ${ingested.sessionId} to the radar and automatic suggestions?\n\n` +
+    `Saved scores for this session are set aside and the forms are refilled from the loaded files. ` +
+    `Reviewer notes and video annotations are kept. Scores the files can't suggest (for example the C0 motion items) will be empty.\n\n` +
+    `Nothing changes in SharePoint until you press Save. Press Save to replace the saved scores; reload the page to back out.`
+  );
+  if (!ok) return;
+  captureActiveNotes();
+  // Carry over any notes typed but not yet saved, then rebuild every form.
+  const typedNotes = {};
+  Object.values(formCache).forEach(f => { if (f.notes) typedNotes[f.docId] = f.notes; });
+  clearLocalCacheForSession(ingested.sessionId);
+  ignoreSavedScoresFor = ingested.sessionId;
+  formCache = {};
+  await seedAllForms();
+  Object.entries(typedNotes).forEach(([docId, notes]) => { if (formCache[docId]) formCache[docId].notes = notes; });
+  renderSessionBanner();
+  if (currentScenarioId) await renderScoringSection();
+  const n = Object.keys(formCache).length;
+  logLine(`<span class="tag warn">reset</span> ${n} form(s) refilled from the radar and automatic suggestions. Press Save to replace the saved scores in SharePoint.`);
+  setSaveStatus('dirty');
 });
 
 document.getElementById('clearLocalBtn').addEventListener('click', async () => {
