@@ -89,6 +89,8 @@ let currentUserRole = null;
 let ingested = {
   sessionId: null, scenarios: {}, evidenceByCapture: {}, validationByCapture: {},
   episodesByCapture: {}, auditByScenario: {}, videosByCapture: {},
+  textFiles: {}, // name -> raw text of every metadata file loaded, so a .bin dropped later can use them
+  binFiles: {},  // name -> File of each .bin dropped by hand (a reference, not its contents), to re-read if its episode files come later
 };
 let currentScenarioId = null;
 let currentEpisodeId = null;
@@ -325,7 +327,24 @@ async function handleFiles(fileList){
   }
   for (const f of files){
     if (isVideoFile(f)) ingestVideo(f);
-    else classifyAndIngest(f.name, await f.text());
+    else {
+      const text = await f.text();
+      ingested.textFiles[f.name] = text;
+      classifyAndIngest(f.name, text);
+    }
+  }
+  // A .bin may have been scored before its capture.json arrived.
+  remapRadarKeys();
+  // ...or before its episode markers / sync JSON arrived, in which case it
+  // has no per-episode scores yet: read it again now that they are here.
+  const rescore = binsMissingEpisodes();
+  if (rescore.length){
+    await scoreDroppedFiles(rescore);
+    return;
+  }
+  if (Object.keys(radarByScenario).length){
+    refreshFormSuggestions();
+    await seedAllForms();
   }
   refreshSessionStatus();
   if (!currentScenarioId){
@@ -360,11 +379,36 @@ async function noteReviewServer(){
     : 'No files loaded yet. Reports and dropped .mmwave.bin files are read in this browser.';
 }
 
+// .bin files read without episode markers + sync JSON whose two files have
+// since been loaded.
+function binsMissingEpisodes(){
+  const names = Object.keys(ingested.textFiles || {});
+  return Object.values(ingested.binFiles || {}).filter(file => {
+    const cap = deriveCaptureIdFromName(file.name);
+    if (!cap) return false;
+    const has = re => names.some(n => deriveCaptureIdFromName(n) === cap && re.test(n));
+    if (!has(/episode_markers/i) || !has(/mmwave_sync|mmwave\.json|mmwave_segments/i)) return false;
+    const entry = Object.values(radarByScenario).find(r => r.bin && r.bin.name === file.name);
+    return !entry || !Object.keys(entry.episodes || {}).length;
+  });
+}
+
+// Metadata files loaded in an earlier drop (capture.json, episode markers,
+// mmwave sync JSON, ...) that are not part of this drop. A .bin dropped on
+// its own still needs them to know its room and episode windows.
+function earlierTextFiles(dropped){
+  const names = new Set(dropped.map(f => f.name));
+  return Object.entries(ingested.textFiles || {})
+    .filter(([name]) => !names.has(name))
+    .map(([name, text]) => new File([text], name, {type: 'text/plain'}));
+}
+
 async function scoreDroppedFiles(files){
   const status = document.getElementById('sessionStatus');
   const drop = document.getElementById('dropzone');
   const videos = files.filter(isVideoFile);
-  const uploads = files.filter(file => !isVideoFile(file));
+  const dropped = files.filter(file => !isVideoFile(file));
+  const uploads = dropped.concat(earlierTextFiles(dropped));
   if (drop) drop.classList.add('busy');
   if (!(await reviewServerReady())){
     await scoreDroppedFilesInBrowser(uploads, videos, status, drop);
@@ -403,7 +447,8 @@ async function scoreDroppedFiles(files){
       return;
     }
     scored = true;
-    const message = await applyReviewResult(data, 'files');
+    const message = await applyReviewResult(data, 'files', {merge: true});
+    dropped.filter(isRadarBin).forEach(f => { ingested.binFiles[f.name] = f; });
     videos.forEach(ingestVideo);
     refreshSessionStatus();
     renderScenarioTabs();
@@ -431,7 +476,8 @@ async function scoreDroppedFilesInBrowser(uploads, videos, status, drop){
     const data = await RadarScore.reviewFromFiles(uploads, async message => {
       if (status) status.textContent = message;
     });
-    const message = await applyReviewResult(data, 'files');
+    const message = await applyReviewResult(data, 'files', {merge: true});
+    uploads.filter(isRadarBin).forEach(f => { ingested.binFiles[f.name] = f; });
     videos.forEach(ingestVideo);
     refreshSessionStatus();
     renderScenarioTabs();
@@ -1482,6 +1528,7 @@ function resetIngested(){
   ingested = {
     sessionId: null, scenarios: {}, evidenceByCapture: {}, validationByCapture: {},
     episodesByCapture: {}, auditByScenario: {}, videosByCapture: {},
+    textFiles: {}, binFiles: {},
   };
   currentScenarioId = null;
   currentEpisodeId = null;
@@ -1545,10 +1592,59 @@ function ensureScenariosFromRadar(rooms){
   });
 }
 
-async function applyReviewResult(data, sourceTag){
-  resetIngested();
-  radarByScenario = indexRadar(data.radar);
-  (data.files || []).forEach(f => classifyAndIngest(f.name, f.text));
+// Radar results are keyed by room (C0, T1-R1, ...). A .bin scored before
+// its capture.json was known lands under its capture id (c001); once the
+// capture.json is loaded, move it to the room it belongs to.
+function remapRadarKeys(){
+  Object.keys(radarByScenario).forEach(key => {
+    if (/^(C0|T1-R\d+)$/.test(key)) return;
+    const owner = Object.values(ingested.scenarios).find(sc => sc.captureId && sc.captureId.toLowerCase() === key.toLowerCase());
+    if (!owner) return;
+    radarByScenario[owner.scenarioId] = radarByScenario[key];
+    delete radarByScenario[key];
+  });
+}
+
+// Recompute the automatic suggestions for every form already built, and
+// fill any item that is still empty. Values the reviewer entered or that
+// were saved are left alone.
+function refreshFormSuggestions(){
+  Object.values(formCache).forEach(form => {
+    let autos;
+    if (form.kind === 'c0') autos = computeScenarioAutos('C0', ITEMS_C0);
+    else if (form.kind === 'technical') autos = computeScenarioAutos(form.scenarioId, ITEMS_TECHNICAL);
+    else if (form.kind === 'participant'){
+      const scenario = ingested.scenarios[form.scenarioId];
+      const ep = scenario && (ingested.episodesByCapture[scenario.captureId] || []).find(e => e.episodeId === form.episodeId);
+      autos = computeParticipantAutos(form.scenarioId, ep);
+    }
+    if (!autos) return;
+    form.autos = autos;
+    form.items.forEach(it => {
+      if ((form.values[it.id] == null || form.values[it.id] === '') && autos[it.id] && autos[it.id].value != null){
+        form.values[it.id] = autos[it.id].value;
+      }
+    });
+  });
+}
+
+// merge: true for files dropped by hand — add to what is already loaded
+// instead of starting over, unless the drop is from a different session.
+async function applyReviewResult(data, sourceTag, opts){
+  const merge = !!(opts && opts.merge);
+  const sameSession = !ingested.sessionId || !data.sessionId || data.sessionId === ingested.sessionId;
+  if (merge && !sameSession){
+    logLine(`<span class="tag warn">${escapeHtml(sourceTag)}</span> these files are from session ${escapeHtml(data.sessionId)}, not ${escapeHtml(ingested.sessionId)} — starting a fresh session`);
+  }
+  const keep = merge && sameSession;
+  if (!keep) resetIngested();
+  Object.assign(radarByScenario, indexRadar(data.radar));
+  (data.files || []).forEach(f => {
+    if (keep && ingested.textFiles[f.name] === f.text) return; // already loaded
+    ingested.textFiles[f.name] = f.text;
+    classifyAndIngest(f.name, f.text);
+  });
+  remapRadarKeys();
   ensureScenariosFromRadar(data.radar);
   (data.videos || []).forEach(v => ingestRemoteVideo(v.name, v.url));
   (data.log || []).forEach(line => logLine(`<span class="tag ok">${escapeHtml(sourceTag)}</span> ${escapeHtml(line)}`));
@@ -1556,7 +1652,8 @@ async function applyReviewResult(data, sourceTag){
     logLine(`<span class="tag warn">radar</span> ${escapeHtml(room.scenarioId)}: ${escapeHtml(room.error || 'extraction failed')}`);
   });
   if (!ingested.sessionId && data.sessionId) ingested.sessionId = data.sessionId;
-  currentScenarioId = getIngestedScenarioIds()[0] || null;
+  if (!keep || !currentScenarioId) currentScenarioId = getIngestedScenarioIds()[0] || null;
+  if (keep) refreshFormSuggestions();
   await seedAllForms();
   refreshSessionStatus();
   renderScenarioTabs();
