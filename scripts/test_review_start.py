@@ -223,12 +223,12 @@ def main():
     app = urllib.request.urlopen(f"http://127.0.0.1:{port}/app.js", timeout=10).read().decode()
     if "beginReview" not in app or "unit === 'positions'" not in app or "integer ? '1'" not in app:
         raise SystemExit("app.js does not step device placements by 1")
-    if "scoreDroppedFiles" not in app or "/api/review/upload" not in app or "/api/review/health" not in app:
-        raise SystemExit("app.js does not stream a manually dropped .bin")
+    if "scoreDroppedFiles" not in app or "/api/review/upload" not in app or "/api/review/health" not in app or "reviewFromFiles" not in app:
+        raise SystemExit("app.js does not read a dropped .bin")
     if "Could not read ${file.name}" in app:
         raise SystemExit("app.js still hides a failed .bin read")
-    if "streamed to disk" not in index:
-        raise SystemExit("index.html does not explain that a dropped .bin is streamed to disk")
+    if "one frame at a time" not in index or "radar_score.js" not in index:
+        raise SystemExit("index.html does not read a dropped .bin in the browser")
     if "ingestVideoZone" in app or "computeBlueZoneAuto" in app:
         raise SystemExit("video analyzer is still in app.js")
     if not ROOT.endswith("QA-App-Sesame") and not os.path.isdir(ROOT):
