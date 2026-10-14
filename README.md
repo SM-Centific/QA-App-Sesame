@@ -17,10 +17,14 @@ Load a session's capture files (JSON/JSONL metadata + the capture videos) and sc
 - **Video annotations** — flag or comment on specific timestamps in a room's video, independent of the episode being scored
 - **Session summary** — always-visible banner showing pass/fail across all four scenarios and the overall session gate
 
+Continuous Movement, Blue Zone % and Orange Zone % are set with a 0–100 meter rather than typed. The meter shows the pass zone (≥85% / ≥75%, or ≤25% for Orange Zone), a tick where the radar put it, and an **adjusted · radar N** badge once a reviewer moves it away from the radar value. Drag it, click the track, or focus it and use the arrow keys; **Clear** empties it. Device Placements (a count) keeps its number box.
+
+Speed Variance and Distance Variance are scored 1 / 2 / 3, where 3 is reserved for great, clearly natural variation. The radar's measured spread suggests a score (speed: 2 from 0.25 m/s, 3 from 0.5 m/s; distance: 2 from 0.5 m, 3 from 1.0 m — provisional cut points in `VARIANCE_BUCKETS`, `app.js`), and the note under each shows the measured value.
+
 ### Automated pre-fills (all reviewer-overridable)
 - **Sync Chirp** — pass/fail from `session_evidence.json`
 - **Audio/Video Quality** — flagged from `session_validation.json`'s integrity issues
-- **Radar scores** — continuous movement, blue zone, orange zone, speed variance, distance variance, and device placements are filled from each room's `.mmwave.bin` when an inspection report is uploaded. The report must list that `.bin` plus the episode markers and mmwave sync JSON. Video-zone logs are not used.
+- **Radar scores** — continuous movement, blue zone, orange zone, speed variance, distance variance, and device placements are filled from each room's `.mmwave.bin`, from either an inspection report or files dropped by hand (see Radar scoring). Video-zone logs are not used.
 
 ## Files the app reads
 
@@ -64,4 +68,20 @@ docs/
 
 ## Radar scoring
 
-Upload an inspection report from **Begin review** while `python3 scripts/review_server.py` is running, or drop each room's `.mmwave.bin` with its episode markers, mmwave sync JSON, and capture.json. On the public site, that drop is read in the browser one frame at a time (`radar_score.js`), using the same steps as `scripts/extract_mmwave_diagnostics.py`, so a multi-gigabyte capture is not loaded into memory. When the local review server is running, the drop is streamed to that script instead. Files in one drop are matched by capture id or room id in the filename (`c004`, `T1-R2`). Scores are suggestions the reviewer can change before Save.
+Blue Zone %, Orange Zone %, Continuous Movement, Speed/Distance Variance and Device Placements are filled from each room's raw `.mmwave.bin`. Two ways in, both on the public site with nothing to install:
+
+- **Inspection report** — drop the CSV under **Begin review**. The page downloads the listed `.bin`, episode markers, mmwave sync JSON, `capture.json`, audit, evidence and validation files from their blob links (`blob_path` + `sas_token`, or any full URL column) and streams each `.bin` through `radar_score.js` one frame at a time, so a multi-gigabyte room is never held in memory. Videos play from `video_preview_url`. **Needs CORS on the blob storage account** for `https://sm-centific.github.io` (GET/HEAD, any headers); without it the browser refuses the download and the status line says so.
+- **Manual files** — drop each room's `.mmwave.bin` together with its episode markers, mmwave sync JSON and `capture.json`. Files are matched to a room by capture id or room id in the filename (`c004`, `T1-R2`).
+
+If `python3 scripts/review_server.py` is running and the app is opened from it, both paths hand the work to that server instead (it runs `scripts/extract_mmwave_diagnostics.py`; no CORS needed). The browser reader and the Python script give identical numbers — `scripts/test_radar_score.js` checks this.
+
+Per-episode zone scores need the episode markers **and** the mmwave sync JSON for that room; without them only the room-wide reading is computed and the episode forms stay empty (the load log says which file was missing). All radar scores are suggestions the reviewer can change before Save; a saved value always wins over a fresh auto-fill.
+
+### Tests
+
+```
+python3 scripts/make_zone_fixture.py /tmp/zone   # synthetic room: episode 1 in front, episode 2 to the side
+node scripts/test_radar_score.js /tmp/zone       # browser reader == Python script
+python3 scripts/test_review_start.py             # local review server end to end
+python3 scripts/test_app_zones.py                # real page in headless Chromium, all four input paths
+```

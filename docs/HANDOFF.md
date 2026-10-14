@@ -116,10 +116,21 @@ ITEMS_PARTICIPANT = [
   continuous_movement: percent, P0, direction: higher_is_better, unit: '%',
   blue_zone_pct:       percent, P1, direction: higher_is_better, unit: '%',
   orange_zone:         percent, P1, direction: lower_is_better,  unit: '%',
-  speed_variance:      percent, P1, direction: higher_is_better, referenceValue: 5.0, unit: 'm/s',
-  distance_variance:   percent, P1, direction: higher_is_better, referenceValue: 1.0, unit: 'm',
+  speed_variance:      scale (1/2/3), P1,
+  distance_variance:   scale (1/2/3), P1,
 ]
 ```
+
+**2026-10-14 change:** Speed Variance and Distance Variance moved from raw
+measurements (`percent` + `referenceValue` 5.0 m/s / 1.0 m) to a 1/2/3
+reviewer scale, where 3 means great, clearly natural variation. The radar's
+measured spread (std dev) still drives a suggested score via
+`VARIANCE_BUCKETS` in `app.js` — speed: 2 from 0.25 m/s, 3 from 0.5 m/s;
+distance: 2 from 0.5 m, 3 from 1.0 m. These cut points are provisional.
+Rows saved before this change hold the raw measurement; the app converts
+them with the same buckets on load, and new rows carry `scoreVersion: 2`.
+`PopulateScorecard.ts` must make the same change (treat these two as
+`scale`) or it will read a 1/2/3 as metres.
 
 ### `toPct(item, rawValue)` — identical logic in both `app.js` and
 `PopulateScorecard.ts`, verified byte-for-byte identical by compiling and

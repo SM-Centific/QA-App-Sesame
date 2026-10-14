@@ -22,9 +22,28 @@ const ITEMS_PARTICIPANT = [
   {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', unit:'%', help:'% of the episode spent in motion (target >75%) — measured from the room\'s radar .mmwave.bin when the inspection report includes it.'},
   {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', direction:'higher_is_better', unit:'%', help:'Time spent inside the 120°×5m forward FOV — measured from the room\'s radar .mmwave.bin.'},
   {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'percent', direction:'lower_is_better', unit:'%', help:'Time spent outside the FOV near 2–3m — measured from the room\'s radar .mmwave.bin. Lower is better (≤25% ≈ passing).'},
-  {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'percent', direction:'higher_is_better', referenceValue:5.0, unit:'m/s', help:'Natural variation in movement speed — more is better (not robotic/staged). Measured directly when available; ≥5.0 m/s ≈ passing.'},
-  {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'percent', direction:'higher_is_better', referenceValue:1.0, unit:'m', help:'Natural variation in near/far distance — more is better (not robotic/staged). Measured directly when available; ≥1.0m ≈ passing.'},
+  {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'scale', help:'Natural variation in movement speed — more is better (not robotic/staged). 1 = little or none · 2 = some · 3 = great, clearly natural. Suggested from the radar\'s speed spread when available.'},
+  {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'scale', help:'Natural variation in near/far distance — more is better (not robotic/staged). 1 = little or none · 2 = some · 3 = great, clearly natural. Suggested from the radar\'s distance spread when available.'},
 ];
+
+// Radar measurement -> suggested 1/2/3 for the two variance items. The
+// radar reports the spread (standard deviation) of speed or distance across
+// the episode's tracked frames; a value at or above `great` suggests 3, at
+// or above `some` suggests 2, otherwise 1. PROVISIONAL cut points, not yet
+// checked against real reviewed episodes; adjust here once they are.
+const VARIANCE_BUCKETS = {
+  speed_variance:    {unit: 'm/s', some: 0.25, great: 0.5},
+  distance_variance: {unit: 'm',   some: 0.5,  great: 1.0},
+};
+function varianceBucket(itemId, measured){
+  const b = VARIANCE_BUCKETS[itemId];
+  if (!b || measured == null || Number.isNaN(Number(measured))) return null;
+  const v = Number(measured);
+  return v >= b.great ? 3 : (v >= b.some ? 2 : 1);
+}
+// Saved rows from before the 1/2/3 change hold the raw measurement for
+// these items. Rows saved from now on carry scoreVersion 2.
+const SCORE_VERSION = 2;
 const MIN_GOOD_EPISODES = 10; // client threshold: a room needs at least this many PASSED episodes
 
 // A session can have any number of T1 rooms — not fixed at 3. These derive
@@ -236,6 +255,10 @@ function classifyAndIngest(filename, text){
     if (obj && Array.isArray(obj.captures) && obj.captures[0] && obj.captures[0].syncEvidence){ ingestSessionEvidence(obj); return; }
     if (obj && obj.phases && obj.phases.P02_scenarioRunner && obj.phases.P02_scenarioRunner.captures){ ingestSessionValidation(obj); return; }
     if (obj && obj.expectedDevices && obj.requiredMask && obj.stepId){ ingestAudit(obj); return; }
+    if (obj && (obj.firstFrameReady || (Array.isArray(obj.segments) && obj.segments[0] && obj.segments[0].firstFrameReady))){
+      logLine(`<span class="tag ok">mmwave_sync</span> ${escapeHtml(filename)} — radar frame timing`);
+      return;
+    }
     logLine(`<span class="tag warn">unrecognized</span> ${escapeHtml(filename)} (valid JSON, unknown shape)`);
   } catch (err){
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean).map(l => { try { return JSON.parse(l); } catch(e){ return null; } }).filter(Boolean);
@@ -298,8 +321,7 @@ async function handleFiles(fileList){
 }
 
 function radarServerMessage(filename){
-  const which = filename ? `${filename} was not read. ` : 'A radar .mmwave.bin cannot be read from this page. ';
-  return `${which}The public site cannot run the radar script. Start python3 scripts/review_server.py and open http://127.0.0.1:8080, then drop the .bin there.`;
+  return `${filename || 'A file'} could not be sent to the local review server. Check that python3 scripts/review_server.py is still running, then drop the files again.`;
 }
 
 async function reviewServerReady(){
@@ -318,7 +340,7 @@ async function noteReviewServer(){
   const session = document.getElementById('sessionStatus');
   if (session) session.textContent = ready
     ? 'No files loaded yet.'
-    : 'No files loaded yet. A dropped .mmwave.bin is read in this browser.';
+    : 'No files loaded yet. Reports and dropped .mmwave.bin files are read in this browser.';
 }
 
 async function scoreDroppedFiles(files){
@@ -469,12 +491,25 @@ function computeParticipantAutos(scenarioId, episode){
   if (episodeScores){
     ITEMS_PARTICIPANT.forEach(it => {
       const hit = episodeScores[it.id];
-      if (hit && hit.value != null) autos[it.id] = hit;
+      if (!hit || hit.value == null) return;
+      if (VARIANCE_BUCKETS[it.id]){
+        const b = VARIANCE_BUCKETS[it.id];
+        const score = varianceBucket(it.id, hit.value);
+        autos[it.id] = Object.assign({}, hit, {
+          value: score,
+          measured: hit.value,
+          note: `Radar spread ${Number(hit.value).toFixed(2)} ${b.unit} → ${score} (2 from ${b.some} ${b.unit}, 3 from ${b.great} ${b.unit}). ${hit.note || ''}`.trim(),
+        });
+      } else {
+        autos[it.id] = hit;
+      }
     });
   }
-  if (autos.blue_zone_pct.value == null){
-    autos.blue_zone_pct.note = 'No radar score yet. The inspection report must include this room\'s .mmwave.bin.';
-  }
+  ['blue_zone_pct','orange_zone'].forEach(id => {
+    if (autos[id].value == null && !autos[id].note){
+      autos[id].note = 'No radar score yet. Load this room\'s .mmwave.bin with its episode markers and mmwave sync JSON.';
+    }
+  });
   return autos;
 }
 
@@ -834,13 +869,64 @@ function scoreSummaryHtml(p0Pct, p1Pct, overall, label){
   </div>`;
 }
 
+// A 0-100 meter for items whose raw value already is a percentage
+// (Continuous Movement, Blue Zone, Orange Zone). The pass line sits where
+// toPct() crosses this item's threshold: >= 85 (P0) / 75 (P1) for
+// higher-is-better, <= 15 / 25 for lower-is-better. A small tick marks the
+// radar's suggestion so it stays visible after the reviewer moves the meter.
+function percentPassLine(it){
+  const threshold = it.priority === 'P0' ? 85 : 75;
+  return it.direction === 'lower_is_better' ? 100 - threshold : threshold;
+}
+function fmtMeter(v){
+  if (v == null || v === '') return '—';
+  const n = Number(v);
+  return (Math.round(n * 10) / 10).toString() + '%';
+}
+function percentMeterHtml(it, value, auto){
+  const set = value != null && value !== '';
+  const v = set ? Math.max(0, Math.min(100, Number(value))) : 0;
+  const line = percentPassLine(it);
+  const lower = it.direction === 'lower_is_better';
+  const passing = set ? (lower ? v <= line : v >= line) : null;
+  const passStart = lower ? 0 : line;
+  const passEnd = lower ? line : 100;
+  const autoV = auto && auto.value != null ? Math.max(0, Math.min(100, Number(auto.value))) : null;
+  const autoTick = autoV != null
+    ? `<span class="meter-auto" style="left:${autoV}%" title="Radar suggested ${fmtMeter(autoV)}"></span>` : '';
+  const state = passing == null ? 'unset' : (passing ? 'pass' : 'fail');
+  return `<div class="meter ${state}">
+    <div class="meter-track">
+      <span class="meter-passzone" style="left:${passStart}%;width:${passEnd - passStart}%"></span>
+      <span class="meter-line" style="left:${line}%"></span>
+      ${autoTick}
+      <input type="range" min="0" max="100" step="1" value="${set ? Math.round(v) : 0}" data-item="${it.id}" data-meter="1" aria-label="${escapeHtml(it.label)} percent">
+    </div>
+    <div class="meter-read">
+      <span class="meter-value" data-meter-value="${it.id}">${set ? fmtMeter(value) : 'Not set'}</span>
+      <span class="meter-hint">pass ${lower ? '≤' : '≥'} ${line}%${autoV != null ? ` · radar ${fmtMeter(autoV)}` : ''}</span>
+      ${set ? `<button type="button" class="meter-clear" data-meter-clear="${it.id}">Clear</button>` : ''}
+    </div>
+  </div>`;
+}
+
 function itemRowHtml(it, value, auto){
-  const autoBadge = (auto && auto.value != null) ? `<span class="badge auto">auto-suggested</span>` : '';
+  const hasAuto = auto && auto.value != null;
+  const adjusted = hasAuto && value != null && value !== '' && Math.abs(Number(value) - Number(auto.value)) > 1e-6
+    && typeof value !== 'string';
+  const cleared = hasAuto && (value == null || value === '');
+  const autoBadge = !hasAuto ? '' : (cleared
+    ? `<span class="badge auto">cleared · radar ${escapeHtml(String(auto.value))}</span>`
+    : adjusted
+      ? `<span class="badge auto">adjusted · radar ${escapeHtml(String(auto.value))}</span>`
+      : `<span class="badge auto">auto-suggested</span>`);
   const noteHtml = (auto && auto.note) ? `<div class="item-note">${escapeHtml(auto.note)}</div>` : '';
   const coverageHtml = (auto && auto.coveragePct != null) ? `<div class="item-note">detector confidence: ${auto.coveragePct.toFixed(0)}% of frames had a detection</div>` : '';
   let control;
   if (it.kind === 'gate'){
     control = ['pass','fail'].map(v => `<button type="button" class="seg ${value===v?'active '+v:''}" data-item="${it.id}" data-value="${v}">${v==='pass'?'Pass':'Fail'}</button>`).join('');
+  } else if (it.kind === 'percent' && it.referenceValue == null && (it.unit || '%') === '%'){
+    control = percentMeterHtml(it, value, auto);
   } else if (it.kind === 'percent'){
     // referenceValue items are raw physical measurements (m/s, meters, a
     // position count), not a 0-100-bounded percentage — no upper cap, and
@@ -867,8 +953,10 @@ async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId, autos
   if (formCache[docId]) return formCache[docId];
   const saved = await loadDoc(docId);
   const values = {};
+  const legacy = saved && saved.scores && !(saved.scoreVersion >= SCORE_VERSION);
   items.forEach(it => {
-    if (saved && saved.scores && saved.scores[it.id] != null) values[it.id] = saved.scores[it.id];
+    if (legacy && VARIANCE_BUCKETS[it.id] && saved.scores[it.id] != null) values[it.id] = varianceBucket(it.id, saved.scores[it.id]);
+    else if (saved && saved.scores && saved.scores[it.id] != null) values[it.id] = saved.scores[it.id];
     else if (autos[it.id] && autos[it.id].value != null) values[it.id] = autos[it.id].value;
     else values[it.id] = null;
   });
@@ -1177,6 +1265,45 @@ function wireItemInputs(containerId, docId, items, kind, scenarioId, episodeId){
       renderScoringSection();
     });
   });
+  container.querySelectorAll('input[type="range"][data-meter]').forEach(inp => {
+    const itemId = inp.dataset.item;
+    // Live readout while dragging; commit (and re-render) only on release,
+    // so the re-render doesn't interrupt the drag.
+    inp.addEventListener('input', () => {
+      const label = container.querySelector(`[data-meter-value="${itemId}"]`);
+      if (label) label.textContent = fmtMeter(inp.value);
+      const meter = inp.closest('.meter');
+      const item = items.find(it => it.id === itemId);
+      if (meter && item){
+        const line = percentPassLine(item);
+        const v = Number(inp.value);
+        const ok = item.direction === 'lower_is_better' ? v <= line : v >= line;
+        meter.classList.remove('unset','pass','fail');
+        meter.classList.add(ok ? 'pass' : 'fail');
+      }
+    });
+    inp.addEventListener('change', async () => {
+      if (!formCache[docId]) return;
+      captureVisibleNotes(docId, kind);
+      const hadFocus = document.activeElement === inp;
+      formCache[docId].values[itemId] = Math.max(0, Math.min(100, Number(inp.value)));
+      await renderScoringSection();
+      // The form is redrawn on each change; keep keyboard focus on this
+      // meter so arrow keys keep stepping it.
+      if (hadFocus){
+        const again = document.querySelector(`input[type="range"][data-item="${itemId}"]`);
+        if (again) again.focus();
+      }
+    });
+  });
+  container.querySelectorAll('[data-meter-clear]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!formCache[docId]) return;
+      captureVisibleNotes(docId, kind);
+      formCache[docId].values[btn.dataset.meterClear] = null;
+      renderScoringSection();
+    });
+  });
   container.querySelectorAll('input[type="number"][data-item]').forEach(inp => {
     inp.addEventListener('change', () => {
       const itemId = inp.dataset.item;
@@ -1237,6 +1364,7 @@ async function saveActiveForm(){
       episodeNumber: form.episodeNumber != null ? form.episodeNumber : null,
       scores: form.values, notes: form.notes,
       p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
+      scoreVersion: SCORE_VERSION,
       savedAt: new Date().toISOString(),
     };
     await saveDoc(docId, payload);
@@ -1348,9 +1476,30 @@ async function applyReviewResult(data, sourceTag){
   renderSessionBanner();
   const bins = data.binsRead || [];
   const listed = bins.map(bin => `${bin.name} (${Number(bin.bytes).toLocaleString()} bytes)`).join('; ');
+  const failed = (data.radar || []).filter(room => room.status === 'error').map(room => room.scenarioId);
+  const failNote = failed.length
+    ? ` ${failed.join(', ')} could not be scored${(data.radar || []).some(r => /CORS/.test(r.error || '')) ? ' (the blob downloads were blocked; the storage account likely needs CORS for this site)' : ''}. See the load log.`
+    : '';
   return listed
-    ? `Read ${listed}. Radar scores were filled from those .bin files. Check them, then Save.`
-    : 'No .mmwave.bin was read, so the radar script did not score this session.';
+    ? `Read ${listed}. Radar scores were filled from those .bin files. Check them, then Save.${failNote}`
+    : `No .mmwave.bin was read, so no radar scores were filled.${failNote}`;
+}
+
+// No review server (e.g. the public GitHub Pages site): read the report
+// here, download the listed files from their blob URLs, and stream each
+// room's .mmwave.bin through the in-browser radar reader.
+async function beginReviewInBrowser(file, status, drop){
+  try {
+    const data = await RadarScore.reviewFromReport(await file.text(), file.name, async message => {
+      if (status) status.textContent = message;
+    });
+    const message = await applyReviewResult(data, 'report');
+    if (status) status.textContent = message;
+  } catch (err){
+    if (status) status.textContent = err && err.message ? `The inspection report could not be read: ${err.message}` : 'The inspection report could not be read.';
+  } finally {
+    if (drop) drop.classList.remove('busy');
+  }
 }
 
 async function beginReview(file){
@@ -1359,8 +1508,7 @@ async function beginReview(file){
   if (status) status.textContent = 'Reading the inspection report and running radar scoring…';
   if (drop) drop.classList.add('busy');
   if (!(await reviewServerReady())){
-    if (status) status.textContent = radarServerMessage();
-    if (drop) drop.classList.remove('busy');
+    await beginReviewInBrowser(file, status, drop);
     return;
   }
   try {
