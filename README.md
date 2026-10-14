@@ -53,6 +53,7 @@ Drop these in (any order, any filename — content is auto-classified):
 
 - **Sign-in:** enter your work email on load. Checked against `tbl_qa_access`; not authorized → no access to the app at all.
 - **Scores:** shared across every reviewer via SharePoint, not per-browser. If the network or a flow call fails, the save still lands in `localStorage` as a fallback, and a warning-free retry happens automatically on the next successful save.
+- **Reset scores to radar** sets aside every saved score for the loaded session and refills the forms from the radar and the other automatic suggestions (notes and video annotations are kept). Use it when old saved values hide the radar's numbers — for example a "3" saved back when Continuous Movement was a 1–3 scale now reads as 3%. Nothing changes in SharePoint until you press Save, which then overwrites the old rows; reload to back out. The app has no delete flow, so this is how a session is cleared.
 - **Export all (.json)** / **Import (.json)** still exist — useful for backups, or moving work between devices in a pinch, independent of the live backend.
 
 ## Repo structure
