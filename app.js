@@ -314,12 +314,11 @@ async function reviewServerReady(){
 }
 
 async function noteReviewServer(){
-  if (await reviewServerReady()) return;
-  const text = radarServerMessage();
-  const review = document.getElementById('reviewStatus');
+  const ready = await reviewServerReady();
   const session = document.getElementById('sessionStatus');
-  if (review) review.textContent = text;
-  if (session) session.textContent = text;
+  if (session) session.textContent = ready
+    ? 'No files loaded yet.'
+    : 'No files loaded yet. A dropped .mmwave.bin is read in this browser.';
 }
 
 async function scoreDroppedFiles(files){
@@ -327,11 +326,9 @@ async function scoreDroppedFiles(files){
   const drop = document.getElementById('dropzone');
   const videos = files.filter(isVideoFile);
   const uploads = files.filter(file => !isVideoFile(file));
-  const binFile = uploads.find(isRadarBin);
   if (drop) drop.classList.add('busy');
   if (!(await reviewServerReady())){
-    if (status) status.textContent = radarServerMessage(binFile && binFile.name);
-    if (drop) drop.classList.remove('busy');
+    await scoreDroppedFilesInBrowser(uploads, videos, status, drop);
     return;
   }
   if (status) status.textContent = 'Streaming the radar .bin to disk. It is not loaded into browser memory.';
@@ -386,6 +383,25 @@ async function scoreDroppedFiles(files){
         });
       } catch (e){}
     }
+    if (drop) drop.classList.remove('busy');
+  }
+}
+
+async function scoreDroppedFilesInBrowser(uploads, videos, status, drop){
+  try {
+    const data = await RadarScore.reviewFromFiles(uploads, async message => {
+      if (status) status.textContent = message;
+    });
+    const message = await applyReviewResult(data, 'files');
+    videos.forEach(ingestVideo);
+    refreshSessionStatus();
+    renderScenarioTabs();
+    renderScenarioShell();
+    renderSessionBanner();
+    if (status) status.textContent = message;
+  } catch (err){
+    if (status) status.textContent = err && err.message ? err.message : 'The radar .bin could not be read in the browser.';
+  } finally {
     if (drop) drop.classList.remove('busy');
   }
 }

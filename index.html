@@ -53,7 +53,7 @@
       <h2>Or load files directly</h2>
       <div class="dropzone" id="dropzone">
         Drop each room's <b>.mmwave.bin</b> in the same selection as its episode markers,<br>mmwave sync JSON, and capture.json. A capture id or room id in the filename<br>(c003, T1-R1) matches those files to the room.<br>
-        The .bin is streamed to disk and scored there. It is not loaded into browser memory.
+        The .bin is read one frame at a time. It is not loaded into browser memory.
         <input type="file" id="fileInput" multiple accept=".bin,.json,.jsonl,.mp4,.mov,.webm,video/*">
       </div>
       <div id="loadLog"></div>
@@ -89,6 +89,7 @@
 
 </div><!-- /appRoot -->
 
+<script src="radar_score.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
