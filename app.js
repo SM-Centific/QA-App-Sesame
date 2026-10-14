@@ -21,7 +21,7 @@ const ITEMS_TECHNICAL = [
 const ITEMS_PARTICIPANT = [
   {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', unit:'%', help:'% of the episode spent in motion (target >75%) — measured from the room\'s radar .mmwave.bin when the inspection report includes it.'},
   {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', direction:'higher_is_better', unit:'%', help:'Time spent inside the 120°×5m forward FOV — measured from the room\'s radar .mmwave.bin.'},
-  {id:'orange_zone', label:'Orange Zone %', priority:'P1', kind:'percent', direction:'lower_is_better', unit:'%', help:'Time spent outside the FOV near 2–3m — measured from the room\'s radar .mmwave.bin. Lower is better (≤25% ≈ passing).'},
+  {id:'outside_far', label:'Outside view beyond 3 m %', priority:'P1', kind:'percent', direction:'lower_is_better', referenceValue:10, unit:'%', help:'Time spent outside the 120° forward view AND past the 3 m warning line — the runbook says turn back before 3 m and do not linger. Brief exits within 3 m are expected and not penalised. Lower is better; ≤10% passes. Measured from the room\'s radar .mmwave.bin.'},
   {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'scale', help:'Natural variation in movement speed — more is better (not robotic/staged). 1 = little or none · 2 = some · 3 = great, clearly natural. Suggested from the radar\'s speed spread when available.'},
   {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'scale', help:'Natural variation in near/far distance — more is better (not robotic/staged). 1 = little or none · 2 = some · 3 = great, clearly natural. Suggested from the radar\'s distance spread when available.'},
 ];
@@ -44,6 +44,17 @@ function varianceBucket(itemId, measured){
 // Saved rows from before the 1/2/3 change hold the raw measurement for
 // these items. Rows saved from now on carry scoreVersion 2.
 const SCORE_VERSION = 2;
+// A saved row's scores with any pre-version-2 variance measurement turned
+// into its 1/2/3 bucket, so old and new rows can be averaged together.
+function scoresOf(doc){
+  const scores = Object.assign({}, (doc && doc.scores) || {});
+  if (doc && !(doc.scoreVersion >= SCORE_VERSION)){
+    Object.keys(VARIANCE_BUCKETS).forEach(id => {
+      if (scores[id] != null) scores[id] = varianceBucket(id, scores[id]);
+    });
+  }
+  return scores;
+}
 const MIN_GOOD_EPISODES = 10; // client threshold: a room needs at least this many PASSED episodes
 
 // A session can have any number of T1 rooms — not fixed at 3. These derive
@@ -323,6 +334,7 @@ async function handleFiles(fileList){
   renderScenarioTabs();
   renderScenarioShell();
   renderSessionBanner();
+  renderSavedList();
 }
 
 function radarServerMessage(filename){
@@ -477,6 +489,7 @@ function computeScenarioAutos(scenarioId, items){
       }
     } else { autos[id].note = 'No session_validation loaded for this capture.'; }
   });
+  if (scenarioId === 'C0') applyC0RigMotion(scenario, autos);
   if (autos.device_placements){
     const hit = radarByScenario[scenarioId] && radarByScenario[scenarioId].technical && radarByScenario[scenarioId].technical.device_placements;
     if (hit && hit.value != null){
@@ -485,6 +498,45 @@ function computeScenarioAutos(scenarioId, items){
     }
   }
   return autos;
+}
+
+// C0 suggestions from the radar's rig-motion reading (how much the rig
+// itself moved; see rig_motion_by_episode in extract_mmwave_diagnostics.py).
+// The radar can tell rest from motion, not the shape of the motion, so the
+// figure-8 and translation suggestions only say "the rig moved a lot".
+// PROVISIONAL cut points, checked on one real C0 capture so far.
+const C0_RIG = {
+  restFirstLastS: 5,      // seconds at each end of the episode checked for rest
+  restGood: 10,           // ≤10% of those seconds moving -> 3
+  restOk: 40,             // ≤40% -> 2, otherwise 1
+  motionGood: 50,         // ≥50% of the middle moving -> 3
+  motionOk: 25,           // ≥25% -> 2, otherwise 1
+};
+function applyC0RigMotion(scenario, autos){
+  const radar = radarByScenario['C0'];
+  const rig = radar && radar.rigMotion;
+  if (!rig || !Object.keys(rig).length) {
+    ['static_5s','figure_8','translation','static_end'].forEach(id => {
+      if (autos[id] && !autos[id].note) autos[id].note = 'No radar reading for C0 yet. Load the C0 .mmwave.bin with its episode markers and mmwave sync JSON.';
+    });
+    return;
+  }
+  const episodes = (scenario && ingested.episodesByCapture[scenario.captureId]) || [];
+  const kept = episodes.filter(e => e.disposition === 'retained' && rig[e.episodeId]);
+  const ep = kept[kept.length - 1] || episodes.find(e => rig[e.episodeId]);
+  const m = ep ? rig[ep.episodeId] : rig[Object.keys(rig)[0]];
+  if (!m) return;
+  const rest = pct => pct == null ? null : (pct <= C0_RIG.restGood ? 3 : pct <= C0_RIG.restOk ? 2 : 1);
+  const motion = pct => pct == null ? null : (pct >= C0_RIG.motionGood ? 3 : pct >= C0_RIG.motionOk ? 2 : 1);
+  const dur = ep && ep.durationMs != null ? ` Episode ${(ep.durationMs / 1000).toFixed(1)} s (target 50–60 s).` : '';
+  const set = (id, value, note) => { if (autos[id]) autos[id] = {value, note}; };
+  set('static_5s', rest(m.moving_pct_first_edge),
+    `Radar: rig moving ${m.moving_pct_first_edge}% of the first ${m.edge_s} s (3 if ≤${C0_RIG.restGood}%, 2 if ≤${C0_RIG.restOk}%).`);
+  set('static_end', rest(m.moving_pct_last_edge),
+    `Radar: rig moving ${m.moving_pct_last_edge}% of the last ${m.edge_s} s (3 if ≤${C0_RIG.restGood}%, 2 if ≤${C0_RIG.restOk}%).${dur}`);
+  const motionNote = `Radar: rig moving ${m.moving_pct_middle}% of the middle of the episode (3 if ≥${C0_RIG.motionGood}%, 2 if ≥${C0_RIG.motionOk}%). The radar sees that the rig moved, not the shape — confirm on the video.`;
+  set('figure_8', motion(m.moving_pct_middle), motionNote);
+  set('translation', motion(m.moving_pct_middle), motionNote);
 }
 
 function computeParticipantAutos(scenarioId, episode){
@@ -509,8 +561,14 @@ function computeParticipantAutos(scenarioId, episode){
         autos[it.id] = hit;
       }
     });
+    const exits = episodeScores.orange_zone;
+    if (autos.outside_far && autos.outside_far.value != null && exits && exits.value != null){
+      autos.outside_far = Object.assign({}, autos.outside_far, {
+        note: `${autos.outside_far.note || ''} · Brief exits within 3 m: ${Number(exits.value).toFixed(1)}% (expected, not scored).`.replace(/^ · /, ''),
+      });
+    }
   }
-  ['blue_zone_pct','orange_zone'].forEach(id => {
+  ['blue_zone_pct','outside_far'].forEach(id => {
     if (autos[id].value == null && !autos[id].note){
       autos[id].note = 'No radar score yet. Load this room\'s .mmwave.bin with its episode markers and mmwave sync JSON.';
     }
@@ -744,7 +802,7 @@ function blendedRoomQuality(technicalValues, participantDocs){
   const p0vals = []; const p1vals = [];
   ITEMS_TECHNICAL.forEach(it => { const pct = toPct(it, technicalValues[it.id]); if (pct != null) (it.priority==='P0'?p0vals:p1vals).push(pct); });
   const avgOf = key => {
-    const nums = participantDocs.map(d => d.scores && d.scores[key]).filter(v => v != null);
+    const nums = participantDocs.map(d => scoresOf(d)[key]).filter(v => v != null);
     return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null;
   };
   ITEMS_PARTICIPANT.forEach(it => {
@@ -766,9 +824,17 @@ async function computeRoomGate(scenarioId){
   const techValues = (techSaved && techSaved.scores) || {};
   const techScores = computeScores(ITEMS_TECHNICAL, techValues);
   const allDocs = await queryAll();
-  const participantDocs = allDocs.filter(d => d.scenarioId === scenarioId && d.kind === 'participant');
   const episodes = ingested.episodesByCapture[scenario.captureId] || [];
-  const retainedCount = episodes.filter(e => e.disposition === 'retained').length;
+  const retained = episodes.filter(e => e.disposition === 'retained');
+  const retainedCount = retained.length;
+  // Only this session's rows count, and only for episodes the operator
+  // retained: an excluded attempt "does not consume a retained-view slot"
+  // (collection runbook), so it can't count toward the room's minimum
+  // either. Without episode markers loaded, every row for the room counts.
+  const retainedIds = new Set(retained.map(e => e.episodeId));
+  const participantDocs = allDocs.filter(d =>
+    d.kind === 'participant' && d.scenarioId === scenarioId && d.sessionId === ingested.sessionId
+    && (!episodes.length || retainedIds.has(d.episodeId)));
   const passedCount = participantDocs.filter(d => d.overall === 'pass').length;
   const meetsMinimum = passedCount >= MIN_GOOD_EPISODES;
   const technicalOk = !techScores.gateFailed && (techScores.p0Pct == null || techScores.p0Pct >= 85) && (techScores.p1Pct == null || techScores.p1Pct >= 75);
@@ -875,11 +941,14 @@ function scoreSummaryHtml(p0Pct, p1Pct, overall, label){
 }
 
 // A 0-100 meter for items whose raw value already is a percentage
-// (Continuous Movement, Blue Zone, Orange Zone). The pass line sits where
+// (Continuous Movement, Blue Zone, Outside view beyond 3 m). The pass line sits where
 // toPct() crosses this item's threshold: >= 85 (P0) / 75 (P1) for
 // higher-is-better, <= 15 / 25 for lower-is-better. A small tick marks the
 // radar's suggestion so it stays visible after the reviewer moves the meter.
 function percentPassLine(it){
+  // A % item may set referenceValue: the raw % that sits exactly on its
+  // pass threshold (see toPct). Otherwise the threshold itself is the line.
+  if (it.referenceValue != null) return it.referenceValue;
   const threshold = it.priority === 'P0' ? 85 : 75;
   return it.direction === 'lower_is_better' ? 100 - threshold : threshold;
 }
@@ -930,7 +999,7 @@ function itemRowHtml(it, value, auto){
   let control;
   if (it.kind === 'gate'){
     control = ['pass','fail'].map(v => `<button type="button" class="seg ${value===v?'active '+v:''}" data-item="${it.id}" data-value="${v}">${v==='pass'?'Pass':'Fail'}</button>`).join('');
-  } else if (it.kind === 'percent' && it.referenceValue == null && (it.unit || '%') === '%'){
+  } else if (it.kind === 'percent' && (it.unit || '%') === '%'){
     control = percentMeterHtml(it, value, auto);
   } else if (it.kind === 'percent'){
     // referenceValue items are raw physical measurements (m/s, meters, a
@@ -1044,7 +1113,7 @@ async function renderScenarioShell(){
   shell.innerHTML = `
     <div class="scenario-header">
       <div><h2>${escapeHtml(currentScenarioId)} — ${escapeHtml(scenario.roomLabel)}</h2>
-      <div class="meta">${escapeHtml(scenario.captureId)}${episodes.length?` · ${episodes.filter(e=>e.disposition==='retained').length}/${episodes.length} retained episodes`:''}</div>
+      <div class="meta">${escapeHtml(scenario.captureId)}${episodes.length?` · ${episodes.filter(e=>e.disposition==='retained').length}/${episodes.length} episodes kept by operator`:''}</div>
       ${auditLine}</div>
     </div>
     ${scopeTabsHtml}
@@ -1199,7 +1268,7 @@ async function renderScoringSection(){
       <div class="panel">
         <div class="gate-stat ${gate.meetsMinimum?'ok':'bad'}">
           <b>${gate.passedCount}</b> of <b>${MIN_GOOD_EPISODES}</b> required good episodes passed
-          <span class="gate-stat-sub">(${gate.retainedCount}/${gate.episodesTotal} episodes retained)</span>
+          <span class="gate-stat-sub">(${gate.retainedCount}/${gate.episodesTotal} episodes kept by operator)</span>
         </div>
         <div class="section-title">Technical checklist <span class="count">room-level · P0 &amp; P1</span></div>
         <div id="techItems">${ITEMS_TECHNICAL.map(it => itemRowHtml(it, techForm.values[it.id], techForm.autos[it.id])).join('')}</div>
@@ -1392,14 +1461,15 @@ async function saveActiveForm(){
 
 async function renderSavedList(){
   const el = document.getElementById('savedList');
-  const docs = (await queryAll()).filter(d => d.kind !== 'annotations');
-  if (!docs.length){ el.innerHTML = `<div class="empty-state" style="padding:14px 4px;">Nothing saved yet.</div>`; return; }
+  const docs = (await queryAll()).filter(d => d.kind !== 'annotations'
+    && (!ingested.sessionId || d.sessionId === ingested.sessionId));
+  if (!docs.length){ el.innerHTML = `<div class="empty-state" style="padding:14px 4px;">${ingested.sessionId ? 'Nothing saved yet for this session.' : 'Nothing saved yet.'}</div>`; return; }
   docs.sort((a,b) => (b.savedAt||'').localeCompare(a.savedAt||''));
   el.innerHTML = docs.map(d => {
-    const label = d.kind === 'c0' ? 'C0' : d.kind === 'technical' ? `${d.scenarioId} · Technical` : `${d.scenarioId} · Episode`;
+    const label = d.kind === 'c0' ? 'C0' : d.kind === 'technical' ? `${d.scenarioId} · Technical` : `${d.scenarioId} · Episode${d.episodeNumber != null ? ' ' + d.episodeNumber : ''}`;
     return `<div class="saved-row">
       <div class="meta"><b>${escapeHtml(label)}</b><span>${d.roomLabel ? escapeHtml(d.roomLabel)+' · ' : ''}${new Date(d.savedAt).toLocaleTimeString()}</span></div>
-      <span class="badge-result ${d.overall}">${d.overall}</span>
+      <span class="badge-result ${d.overall || ''}">${escapeHtml(d.overall || '—')}</span>
     </div>`;
   }).join('');
 }
@@ -1430,8 +1500,13 @@ function indexRadar(rooms){
   (rooms || []).forEach(room => {
     if (!room || !room.scenarioId) return;
     const episodes = {};
-    (room.episodes || []).forEach(ep => { if (ep && ep.episodeId) episodes[ep.episodeId] = ep.scores || {}; });
-    out[room.scenarioId] = {technical: room.technical || {}, episodes, status: room.status, error: room.error, bin: room.bin || null};
+    const rigMotion = {};
+    (room.episodes || []).forEach(ep => {
+      if (!ep || !ep.episodeId) return;
+      episodes[ep.episodeId] = ep.scores || {};
+      if (ep.rigMotion) rigMotion[ep.episodeId] = ep.rigMotion;
+    });
+    out[room.scenarioId] = {technical: room.technical || {}, episodes, rigMotion, status: room.status, error: room.error, bin: room.bin || null};
   });
   return out;
 }
@@ -1487,6 +1562,7 @@ async function applyReviewResult(data, sourceTag){
   renderScenarioTabs();
   renderScenarioShell();
   renderSessionBanner();
+  renderSavedList();
   const bins = data.binsRead || [];
   const listed = bins.map(bin => `${bin.name} (${Number(bin.bytes).toLocaleString()} bytes)`).join('; ');
   const failed = (data.radar || []).filter(room => room.status === 'error').map(room => room.scenarioId);
@@ -1498,49 +1574,106 @@ async function applyReviewResult(data, sourceTag){
     : `No .mmwave.bin was read, so no radar scores were filled.${failNote}`;
 }
 
-// No review server (e.g. the public GitHub Pages site): read the report
-// here, download the listed files from their blob URLs, and stream each
-// room's .mmwave.bin through the in-browser radar reader.
-async function beginReviewInBrowser(file, status, drop){
+// A daily inspection report can hold several sessions. The report is read
+// once; the reviewer picks which session to load, and only that session's
+// files are downloaded. Picking another session re-uses the same report.
+let loadedReport = null; // {name, sessions: [{sessionId, rows, rooms, bins}]}
+let activeReportSession = null;
+
+async function beginReview(file){
+  const status = document.getElementById('reviewStatus');
+  let sessions;
   try {
-    const data = await RadarScore.reviewFromReport(await file.text(), file.name, async message => {
-      if (status) status.textContent = message;
+    sessions = RadarScore.reportSessions(await file.text(), file.name);
+  } catch (err){
+    if (status) status.textContent = `The inspection report could not be read: ${err && err.message ? err.message : err}`;
+    return;
+  }
+  if (!sessions.length){
+    if (status) status.textContent = 'The inspection report has no file rows.';
+    return;
+  }
+  loadedReport = {name: file.name, sessions};
+  activeReportSession = null;
+  if (sessions.length === 1){
+    renderSessionPicker();
+    await reviewReportSession(sessions[0].sessionId);
+    return;
+  }
+  renderSessionPicker();
+  if (status) status.textContent = `This report lists ${sessions.length} sessions. Choose one to load.`;
+}
+
+function renderSessionPicker(){
+  const el = document.getElementById('reportSessions');
+  if (!el) return;
+  if (!loadedReport || loadedReport.sessions.length < 2){ el.innerHTML = ''; return; }
+  el.innerHTML = loadedReport.sessions.map(sess => {
+    const rooms = sess.rooms.length ? `${sess.rooms.length} room${sess.rooms.length === 1 ? '' : 's'}` : 'no T1 rooms';
+    const active = sess.sessionId === activeReportSession;
+    return `<button type="button" class="session-pick${active ? ' active' : ''}" data-session="${escapeHtml(sess.sessionId)}">
+      <span class="session-pick-id">${escapeHtml(sess.sessionId || 'unnamed session')}</span>
+      <span class="session-pick-meta">${rooms} · ${sess.bins} radar file${sess.bins === 1 ? '' : 's'}${active ? ' · loaded' : ''}</span>
+    </button>`;
+  }).join('');
+  el.querySelectorAll('[data-session]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const drop = document.getElementById('reportDrop');
+      if (drop && drop.classList.contains('busy')) return;
+      reviewReportSession(btn.dataset.session);
     });
+  });
+}
+
+async function reviewReportSession(sessionId){
+  if (!loadedReport) return;
+  const sess = loadedReport.sessions.find(x => x.sessionId === sessionId);
+  if (!sess) return;
+  const status = document.getElementById('reviewStatus');
+  const drop = document.getElementById('reportDrop');
+  // Just this session's rows, as a JSON report both readers accept.
+  const body = JSON.stringify(sess.rows);
+  const name = 'inspection_report_session.json';
+  activeReportSession = sessionId;
+  renderSessionPicker();
+  document.querySelectorAll('#reportSessions .session-pick').forEach(b => b.disabled = true);
+  if (status) status.textContent = `Loading session ${sessionId || ''} and running radar scoring…`;
+  if (drop) drop.classList.add('busy');
+  try {
+    let data;
+    if (await reviewServerReady()){
+      let res;
+      try {
+        res = await fetch('/api/review/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'text/plain; charset=utf-8', 'X-Report-Name': name},
+          body,
+        });
+      } catch (err){
+        if (status) status.textContent = 'The review server stopped responding. Start python3 scripts/review_server.py again, or open the public site, and pick the session again.';
+        return;
+      }
+      data = await res.json().catch(() => ({}));
+      if (!res.ok){
+        if (status) status.textContent = data.error || 'The inspection report could not be processed.';
+        return;
+      }
+    } else {
+      // No review server (e.g. the public GitHub Pages site): download the
+      // listed files from their blob URLs and stream each room's .bin
+      // through the in-browser radar reader.
+      data = await RadarScore.reviewFromReport(body, name, async message => {
+        if (status) status.textContent = message;
+      });
+    }
+    if (!data.sessionId && sessionId) data.sessionId = sessionId;
     const message = await applyReviewResult(data, 'report');
     if (status) status.textContent = message;
   } catch (err){
     if (status) status.textContent = err && err.message ? `The inspection report could not be read: ${err.message}` : 'The inspection report could not be read.';
   } finally {
     if (drop) drop.classList.remove('busy');
-  }
-}
-
-async function beginReview(file){
-  const status = document.getElementById('reviewStatus');
-  const drop = document.getElementById('reportDrop');
-  if (status) status.textContent = 'Reading the inspection report and running radar scoring…';
-  if (drop) drop.classList.add('busy');
-  if (!(await reviewServerReady())){
-    await beginReviewInBrowser(file, status, drop);
-    return;
-  }
-  try {
-    const res = await fetch('/api/review/start', {
-      method: 'POST',
-      headers: {'Content-Type': 'text/plain; charset=utf-8', 'X-Report-Name': file.name},
-      body: await file.text(),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok){
-      if (status) status.textContent = data.error || 'The inspection report could not be processed.';
-      return;
-    }
-    const message = await applyReviewResult(data, 'report');
-    if (status) status.textContent = message;
-  } catch (err){
-    if (status) status.textContent = 'The review server is not running, so the radar scripts did not run. Start python3 scripts/review_server.py and upload the report again.';
-  } finally {
-    if (drop) drop.classList.remove('busy');
+    renderSessionPicker();
   }
 }
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Browser check: Blue/Orange Zone are filled on the episode forms.
+"""Browser check: radar scores are filled on the forms.
 
-Builds the zone fixture (episode 1 in front, episode 2 to the side), then
-drives the real page in headless Chromium through each input path:
+Builds the zone fixture (episode 1 in front = Blue, episode 2 a brief exit
+to the side within 3 m, episode 3 lingering to the side beyond 3 m, plus a
+C0 capture where the rig rests, is moved, and rests), then drives the real
+page in headless Chromium through each input path:
 
   * public  / files   - static hosting (like GitHub Pages), files dropped by hand
   * public  / report  - static hosting, inspection CSV uploaded
@@ -10,6 +12,9 @@ drives the real page in headless Chromium through each input path:
   * server  / report  - review_server.py running, inspection CSV uploaded
   * public  / no-cors - static hosting, blob host without CORS: expect a clear
                         message naming CORS instead of silent empty scores
+  * <host>  / daily   - a daily report with two sessions (session taken from the
+                        UUID in each blob path): pick the second one; only its
+                        files may be downloaded and it must load as its own session
 
 The Power Automate sign-in and score endpoints are faked so no real
 SharePoint data is read or written.
@@ -37,10 +42,15 @@ from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent.parent
 STEM = "P02_scenarioRunner_c004"
-EXPECT = {  # episodeId -> (blue %, orange %)
+EXPECT = {  # episodeId -> (blue %, outside view beyond 3 m %)
     "ep-1": (100.0, 0.0),
-    "ep-2": (0.0, 100.0),
+    "ep-2": (0.0, 0.0),     # brief exit within 3 m: allowed, not counted
+    "ep-3": (0.0, 100.0),
 }
+# C0 suggestions from rig motion: at rest at both ends, moved in the middle
+# for 4 of the middle 10 s (40%), which suggests a 2 for the motion items.
+EXPECT_C0 = {"static_5s": 3, "static_end": 3, "figure_8": 2, "translation": 2}
+C0_STEM = "P02_scenarioRunner_c001"
 
 
 def free_port():
@@ -49,8 +59,15 @@ def free_port():
         return s.getsockname()[1]
 
 
+REQUESTED = []  # paths fetched from the fake blob host
+
+
 class CorsHandler(http.server.SimpleHTTPRequestHandler):
     """Static files with the CORS headers Azure Blob sends once CORS is enabled."""
+
+    def do_GET(self):
+        REQUESTED.append(self.path.split("?")[0])
+        return super().do_GET()
 
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -127,8 +144,10 @@ def episode_values(page):
       const out = {};
       Object.values(formCache).forEach(f => {
         if (f.kind === 'participant') out[f.episodeId] = {
-          blue: f.values.blue_zone_pct, orange: f.values.orange_zone,
+          blue: f.values.blue_zone_pct, orange: f.values.outside_far,
           blueNote: f.autos.blue_zone_pct && f.autos.blue_zone_pct.note };
+        if (f.kind === 'c0') out.__c0 = {static_5s: f.values.static_5s, static_end: f.values.static_end,
+          figure_8: f.values.figure_8, translation: f.values.translation};
       });
       return out;
     }""")
@@ -144,7 +163,7 @@ def run_case(browser, app_url, mode, fixture, report="inspection_report.csv"):
     page.click("#accessSubmit")
     page.wait_for_selector("#appRoot", state="visible")
     if mode == "files":
-        files = [str(fixture / f"{STEM}{ext}") for ext in
+        files = [str(fixture / f"{stem}{ext}") for stem in (STEM, C0_STEM) for ext in
                  (".mmwave.bin", ".episode_markers.jsonl", ".mmwave_sync.json", ".capture.json")]
         page.set_input_files("#fileInput", files)
         status_sel = "#sessionStatus"
@@ -168,8 +187,66 @@ def run_case(browser, app_url, mode, fixture, report="inspection_report.csv"):
     return vals, status, errors
 
 
-def check(vals):
+SESSION_A = "11111111-aaaa-4aaa-8aaa-111111111111"
+SESSION_B = "22222222-bbbb-4bbb-8bbb-222222222222"
+
+
+def build_daily_report(fixture, port):
+    """Two sessions laid out like blob storage: <uuid>/phases/P02_scenarioRunner/raw/<file>.
+    No session_id column, so the app has to take the session from the path."""
+    names = [f"{STEM}{ext}" for ext in (".mmwave.bin", ".episode_markers.jsonl", ".mmwave_sync.json", ".capture.json")]
+    lines = ["scenario_id,filename,blob_path,sas_token,video_preview_url"]
+    for sid in (SESSION_A, SESSION_B):
+        raw = fixture / sid / "phases" / "P02_scenarioRunner" / "raw"
+        raw.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            src = fixture / name
+            if name.endswith(".capture.json"):
+                obj = json.loads(src.read_text())
+                obj["sessionId"] = sid
+                (raw / name).write_text(json.dumps(obj))
+            elif not (raw / name).exists():
+                (raw / name).symlink_to(src)
+            lines.append(f"T1-R2,{name},http://127.0.0.1:{port}/{sid}/phases/P02_scenarioRunner/raw/{name},sv=test&sig=x,")
+    (fixture / "daily_report.csv").write_text("\n".join(lines) + "\n")
+
+
+def run_daily(browser, app_url, fixture):
+    page = browser.new_page()
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    fake_backend(page)
+    page.goto(app_url)
+    page.fill("#accessEmail", "tester@centific.com")
+    page.click("#accessSubmit")
+    page.wait_for_selector("#appRoot", state="visible")
+    REQUESTED.clear()
+    page.set_input_files("#reportInput", str(fixture / "daily_report.csv"))
+    page.wait_for_selector("#reportSessions .session-pick", timeout=10000)
+    picks = page.locator("#reportSessions .session-pick").count()
+    downloads_before_pick = len(REQUESTED)
+    page.locator(f'#reportSessions [data-session="{SESSION_B}"]').click()
+    deadline = time.time() + 120
+    vals = {}
+    while time.time() < deadline:
+        vals = episode_values(page)
+        if all(k in vals and vals[k]["blue"] is not None for k in EXPECT):
+            break
+        page.wait_for_timeout(500)
+    loaded = page.evaluate("ingested.sessionId")
+    active = page.locator("#reportSessions .session-pick.active").inner_text()
+    page.close()
+    return {"picks": picks, "downloads_before_pick": downloads_before_pick, "loaded": loaded,
+            "active": active, "vals": vals, "errors": errors, "requested": list(REQUESTED)}
+
+
+def check(vals, c0=True):
     problems = []
+    if c0:
+        got = vals.get("__c0") or {}
+        for item, want in EXPECT_C0.items():
+            if got.get(item) != want:
+                problems.append(f"C0 {item}: {got.get(item)} (want {want})")
     for ep, (blue, orange) in EXPECT.items():
         got = vals.get(ep)
         if not got:
@@ -191,6 +268,7 @@ def main():
     # Same files from a host that sends no CORS headers.
     nocors_port = free_port()
     serve(fixture, QuietStatic, nocors_port)
+    build_daily_report(fixture, blob_port)
     report = (fixture / "inspection_report.csv").read_text()
     (fixture / "inspection_report_nocors.csv").write_text(
         report.replace(f"127.0.0.1:{blob_port}", f"127.0.0.1:{nocors_port}"))
@@ -216,8 +294,26 @@ def main():
             problems = check(vals) + [f"page error: {e}" for e in errors]
             tag = "PASS" if not problems else "FAIL"
             failures += bool(problems)
-            tqdm.write(f"[{tag}] {name}/{mode}: {json.dumps({k: (v['blue'], v['orange']) for k, v in vals.items()})}")
+            tqdm.write(f"[{tag}] {name}/{mode}: {json.dumps({k: (v['blue'], v['orange']) if k != '__c0' else v for k, v in vals.items()})}")
             tqdm.write(f"        status: {status}")
+            for prob in problems:
+                tqdm.write(f"        - {prob}")
+        for name, url, _ in hosts:
+            r = run_daily(browser, url, fixture)
+            problems = check(r["vals"], c0=False) + [f"page error: {e}" for e in r["errors"]]
+            if r["picks"] != 2:
+                problems.append(f"expected 2 sessions to pick from, got {r['picks']}")
+            if r["downloads_before_pick"]:
+                problems.append(f"{r['downloads_before_pick']} file(s) downloaded before a session was picked")
+            if r["loaded"] != SESSION_B:
+                problems.append(f"loaded session {r['loaded']}, want {SESSION_B}")
+            wrong = [p for p in r["requested"] if SESSION_A in p]
+            if wrong:
+                problems.append(f"downloaded the other session's files: {wrong}")
+            failures += bool(problems)
+            tqdm.write(f"[{'PASS' if not problems else 'FAIL'}] {name}/daily: {r['picks']} sessions, loaded {r['loaded']}, "
+                       f"{len(r['requested'])} file(s) fetched, none from the other session" if not problems else
+                       f"[FAIL] {name}/daily")
             for prob in problems:
                 tqdm.write(f"        - {prob}")
         public = next((h for h in hosts if h[0] == "public"), None)

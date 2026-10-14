@@ -42,11 +42,13 @@
       <h2>Begin review</h2>
       <div class="dropzone" id="reportDrop">
         Drop an inspection report (.csv) here, or click to browse.<br>
+        If the day's report lists several sessions, pick one below.<br>
         Each room row must include the raw <b>.mmwave.bin</b>, episode markers, and mmwave sync JSON.<br>
         The files are downloaded from their links and each .bin is read to fill the radar scores, including Blue and Orange Zone.
         <input type="file" id="reportInput" accept=".csv,text/csv,.json,application/json">
       </div>
       <div class="status-line" id="reviewStatus">Nothing is scored until each room's .mmwave.bin has been read.</div>
+      <div class="session-picker" id="reportSessions"></div>
     </div>
 
     <div class="panel">

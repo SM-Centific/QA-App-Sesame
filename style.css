@@ -287,3 +287,18 @@
 .access-box button { width: 100%; }
 .access-msg { color: var(--fail); font-size: 12.5px; margin-top: 10px; min-height: 1em; }
 #signOutBtn { color: var(--accent); }
+
+/* Session picker for a daily inspection report with several sessions */
+.session-picker { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.session-picker:empty { display: none; }
+.session-pick {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%;
+  text-align: left; padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text); font: inherit;
+}
+.session-pick:hover:not(:disabled) { border-color: var(--accent); }
+.session-pick:disabled { cursor: default; opacity: .7; }
+.session-pick.active { border-color: var(--accent); background: var(--accent-soft); opacity: 1; }
+.session-pick-id { font-family: var(--font-mono); font-size: 12px; word-break: break-all; }
+.session-pick-meta { color: var(--muted); font-size: 12px; }
+.session-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

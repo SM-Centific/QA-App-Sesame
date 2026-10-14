@@ -101,7 +101,7 @@
       framesTracked: 0,
       framesSearching: 0,
       framesMoving: 0,
-      zones: {blue: 0, orange: 0, neither: 0},
+      zones: {blue: 0, orange: 0, outside_far: 0, neither: 0},
       ranges: [],
       speeds: [],
     };
@@ -132,6 +132,7 @@
       zone_pct_of_tracked_frames: {
         blue: round(100 * acc.zones.blue / tracked, 1),
         orange: round(100 * acc.zones.orange / tracked, 1),
+        outside_far: round(100 * acc.zones.outside_far / tracked, 1),
         neither: round(100 * acc.zones.neither / tracked, 1),
       },
       continuous_movement_pct: acc.framesTracked ? round(100 * acc.framesMoving / tracked, 1) : null,
@@ -243,6 +244,7 @@
       return (d * numRx + ant) * numSamples + r;
     }
 
+    const backgroundSeries = []; // one value per frame, for rigMotionByEpisode()
     for (let frameIdx = 0; frameIdx < nFrames; frameIdx++) {
       const raw = await readSamples(file, frameIdx * frameBytes, frameSamples);
       for (let chirp = 0; chirp < numChirps; chirp++) {
@@ -318,6 +320,7 @@
         }
       }
       const background = usable.length ? median(usable) : 0;
+      backgroundSeries.push(background);
 
       function bestPeak(d0, d1, r0, r1) {
         let best = -1;
@@ -403,6 +406,7 @@
         if (azimuthSmooth == null) zone = '';
         else if (inFront && peakRange <= opt.blueMaxRange) zone = 'blue';
         else if (!inFront && peakRange <= opt.orangeMaxRange) zone = 'orange';
+        else if (!inFront) zone = 'outside_far';
         else zone = 'neither';
         if (trackState === 'locked' && prevLocked && prevX != null && x != null) {
           const dt = timeS - prevTime;
@@ -449,16 +453,70 @@
         routing: estimated >= (opt.minPositions + opt.positionClearMargin) ? 'auto_clear' : 'manual_review',
       };
     }
+    const rig = rigMotionByEpisode(backgroundSeries, windows, opt.frameRateHz, opt.warmup);
     const episodeSummaries = windows.map(w => Object.assign({
       episode_id: w.episode_id,
       episode_number: w.episode_number,
-    }, summarize(episodeAcc[w.episode_id])));
+    }, summarize(episodeAcc[w.episode_id]), {rig_motion: rig[w.episode_id] || null}));
     return {
       frames: nFrames,
       bytes: file.size,
       summary: Object.assign(summarize(summary), {device_placements: placements}),
       episodes: episodeSummaries,
     };
+  }
+
+  // Same as rig_motion_by_episode() in extract_mmwave_diagnostics.py: how
+  // much the rig itself moved in each episode, from the rise in
+  // clutter-subtracted background energy over its at-rest baseline.
+  function percentile(sorted, q) {
+    if (!sorted.length) return null;
+    const pos = (sorted.length - 1) * q / 100;
+    const lo = Math.floor(pos);
+    const hi = Math.ceil(pos);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+  }
+
+  function rigMotionByEpisode(series, windows, frameRate, warmupFrames, ratio, smoothFrames, edgeS) {
+    ratio = ratio || 1.2; smoothFrames = smoothFrames || 10; edgeS = edgeS || 5;
+    const out = {};
+    if (!windows.length || !series.length) return out;
+    const bg = series.map((v, i) => (i < warmupFrames ? NaN : v));
+    const half = smoothFrames >> 1;
+    const smooth = bg.map((_, i) => {
+      const win = bg.slice(Math.max(0, i - half), i + half).filter(v => !Number.isNaN(v));
+      return win.length ? median(win) : NaN;
+    });
+    const time = i => i / frameRate;
+    const firstStart = Math.min.apply(null, windows.map(w => w.start_time_s));
+    const pre = [];
+    bg.forEach((v, i) => {
+      const t = time(i);
+      if (!Number.isNaN(v) && t >= warmupFrames / frameRate + 1 && t < firstStart - 0.5) pre.push(v);
+    });
+    windows.forEach(w => {
+      const inside = [];
+      smooth.forEach((v, i) => { const t = time(i); if (t >= w.start_time_s && t <= w.end_time_s && !Number.isNaN(v)) inside.push(i); });
+      if (!inside.length) return;
+      let baseline;
+      let source;
+      if (pre.length >= 10) { baseline = median(pre); source = 'before_first_episode'; }
+      else { baseline = percentile(inside.map(i => smooth[i]).sort((a, b) => a - b), 20); source = 'episode_low_20pct'; }
+      if (!(baseline > 0)) return;
+      const pct = test => {
+        const idx = inside.filter(i => test(time(i)));
+        if (!idx.length) return null;
+        return round(100 * idx.filter(i => smooth[i] > ratio * baseline).length / idx.length, 1);
+      };
+      out[w.episode_id] = {
+        baseline_energy: round(baseline, 1), baseline_source: source, ratio: ratio, edge_s: edgeS,
+        moving_pct: pct(() => true),
+        moving_pct_first_edge: pct(t => t < w.start_time_s + edgeS),
+        moving_pct_last_edge: pct(t => t > w.end_time_s - edgeS),
+        moving_pct_middle: pct(t => t >= w.start_time_s + edgeS && t <= w.end_time_s - edgeS),
+      };
+    });
+    return out;
   }
 
   function scoreEntry(value, note, coverage) {
@@ -475,6 +533,7 @@
       continuous_movement: scoreEntry(summary.continuous_movement_pct, note, summary.pct_tracked),
       blue_zone_pct: scoreEntry(zones.blue, note, summary.pct_tracked),
       orange_zone: scoreEntry(zones.orange, note, summary.pct_tracked),
+      outside_far: scoreEntry(zones.outside_far, note, summary.pct_tracked),
       speed_variance: scoreEntry(summary.speed_variance_mps, note + ', speed std m/s'),
       distance_variance: scoreEntry(summary.distance_variance_m, note + ', distance std m'),
     };
@@ -578,6 +637,7 @@
         technical: technicalFromSummary(result.summary),
         episodes: result.episodes.map(ep => ({
           episodeId: ep.episode_id,
+          rigMotion: ep.rig_motion || null,
           scores: scoresFromSummary(ep, `episode ${ep.episode_number}`),
         })),
       });
@@ -817,5 +877,43 @@
     return result;
   }
 
-  return {scoreBinFile, reviewFromFiles, reviewFromReport, parseCsv, fft};
+  // A daily inspection report lists every session collected that day.
+  // A row's session is its session_id column, or else the session UUID in
+  // its blob path / URL (…/<session-uuid>/phases/P02_scenarioRunner/raw/…).
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  function rowSession(row) {
+    const direct = firstValue(row, ['session_id', 'sessionid', 'session']);
+    if (direct) return direct;
+    for (const key of ['blob_path', 'url', 'file_url', 'sas_url', 'blob_url', 'video_preview_url', 'filename', 'file_name', 'blob_name']) {
+      const m = UUID_RE.exec(row[key] || '');
+      if (m) return m[0].toLowerCase();
+    }
+    return '';
+  }
+
+  // Groups a report's rows by session. Returns [{sessionId, rows, rooms,
+  // bins}] in report order; rows with no session go to sessionId ''.
+  function reportSessions(text, reportName) {
+    const rows = reportRows(text, reportName);
+    const groups = new Map();
+    rows.forEach(row => {
+      const id = rowSession(row);
+      if (!groups.has(id)) groups.set(id, {sessionId: id, rows: [], rooms: new Set(), bins: 0});
+      const g = groups.get(id);
+      g.rows.push(row);
+      const url = rowUrl(row);
+      const name = rowName(row, url);
+      const scen = (firstValue(row, ['scenario_id', 'scenario', 'room', 'room_id', 'step_id']) || scenarioIdFromName(name)).toUpperCase();
+      if (/^T1-R\d+$/.test(scen)) g.rooms.add(scen);
+      if (/\.bin$/i.test(name)) g.bins += 1;
+    });
+    // Rows without a session id (e.g. a shared file) belong to every session.
+    const shared = groups.get('');
+    const list = Array.from(groups.values()).filter(g => g.sessionId);
+    if (shared && list.length) list.forEach(g => { g.rows = g.rows.concat(shared.rows); });
+    else if (shared) list.push(shared);
+    return list.map(g => ({sessionId: g.sessionId, rows: g.rows, rooms: Array.from(g.rooms).sort(), bins: g.bins}));
+  }
+
+  return {scoreBinFile, reviewFromFiles, reviewFromReport, reportSessions, parseCsv, fft};
 });

@@ -267,6 +267,7 @@ def scores_from_summary(summary, label):
         "continuous_movement": score_entry(summary.get("continuous_movement_pct"), note, coverage),
         "blue_zone_pct": score_entry(zones.get("blue"), note, coverage),
         "orange_zone": score_entry(zones.get("orange"), note, coverage),
+        "outside_far": score_entry(zones.get("outside_far"), note, coverage),
         "speed_variance": score_entry(summary.get("speed_variance_mps"), note + ", speed std m/s"),
         "distance_variance": score_entry(summary.get("distance_variance_m"), note + ", distance std m"),
     }
@@ -500,6 +501,7 @@ def finish_review(downloaded, work_dir, files_out, videos_out, radar_out, messag
             for episode in (episodes_summary or {}).get("episodes") or []:
                 episodes.append({
                     "episodeId": episode.get("episode_id"),
+                    "rigMotion": episode.get("rig_motion"),
                     "scores": scores_from_summary(episode, f"episode {episode.get('episode_number')}"),
                 })
             radar_out.append({
