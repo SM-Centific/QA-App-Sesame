@@ -502,7 +502,14 @@
     return m[1].toUpperCase() === 'C0' ? 'C0' : m[1].toUpperCase();
   }
 
-  async function reviewFromFiles(files, onProgress) {
+  // files: File objects, or file-like objects with name, size, text() and
+  // slice(). An object may also carry captureId / scenarioId (from an
+  // inspection-report row); otherwise both come from the filename.
+  // options.requireBin (default true): throw when no .bin is present.
+  // options.videos: [{name, url}] passed through for the player.
+  // options.log: lines to show before the per-room lines.
+  async function reviewFromFiles(files, onProgress, options) {
+    const opts = Object.assign({requireBin: true, videos: [], log: []}, options || {});
     const list = Array.from(files);
     const textFiles = [];
     const bins = [];
@@ -512,8 +519,13 @@
         textFiles.push({name: file.name, text: await file.text(), file: file});
       }
     }
-    if (!bins.length) throw new Error('Drop a .mmwave.bin to score the room.');
-    const parsed = textFiles.map(item => ({name: item.name, text: item.text, captureId: captureIdFromName(item.name), scenarioId: scenarioIdFromName(item.name)}));
+    if (!bins.length && opts.requireBin) throw new Error('Drop a .mmwave.bin to score the room.');
+    const parsed = textFiles.map(item => ({
+      name: item.name,
+      text: item.text,
+      captureId: item.file.captureId || captureIdFromName(item.name),
+      scenarioId: item.file.scenarioId || scenarioIdFromName(item.name),
+    }));
     parsed.forEach(item => {
       const trimmed = item.text.trim();
       if (trimmed.startsWith('{')) {
@@ -529,22 +541,34 @@
     });
     const radar = [];
     const binsRead = [];
-    const log = [];
+    const log = opts.log.slice();
     for (const bin of bins) {
-      const captureId = captureIdFromName(bin.name);
+      const captureId = bin.captureId || captureIdFromName(bin.name);
       const companions = parsed.filter(item => captureId && item.captureId === captureId);
       const markers = companions.find(item => /episode_markers/i.test(item.name));
       const sync = companions.find(item => /mmwave_sync|mmwave\.json|mmwave_segments/i.test(item.name));
       const capture = companions.find(item => item.kind === 'capture') || parsed.find(item => item.kind === 'capture' && item.captureId === captureId);
-      let scenarioId = (capture && capture.scenarioId) || scenarioIdFromName(bin.name) || captureId || 'UNKNOWN';
-      if (onProgress) await onProgress(`Reading ${bin.name} (${bin.size.toLocaleString()} bytes) in this browser…`);
-      const result = await scoreBinFile(bin, {
-        markersText: markers && markers.text,
-        syncText: sync && sync.text,
-        onProgress: async (done, total) => {
-          if (onProgress) await onProgress(`Reading ${bin.name}: frame ${done.toLocaleString()} of ${total.toLocaleString()}.`);
-        },
-      });
+      let scenarioId = (capture && capture.scenarioId) || bin.scenarioId || scenarioIdFromName(bin.name) || captureId || 'UNKNOWN';
+      if (!markers || !sync) {
+        log.push(`${bin.name}: ${!markers ? 'episode markers' : 'mmwave sync JSON'} not found for ${captureId || scenarioId}, so per-episode Blue/Orange Zone cannot be filled for this room.`);
+      }
+      let result;
+      try {
+        if (bin.open) await bin.open();
+        if (onProgress) await onProgress(`Reading ${bin.name} (${bin.size.toLocaleString()} bytes) in this browser…`);
+        result = await scoreBinFile(bin, {
+          markersText: markers && markers.text,
+          syncText: sync && sync.text,
+          onProgress: async (done, total) => {
+            if (onProgress) await onProgress(`Reading ${bin.name}: frame ${done.toLocaleString()} of ${total.toLocaleString()} (${Math.floor(100 * done / total)}%).`);
+          },
+        });
+      } catch (err) {
+        radar.push({scenarioId: scenarioId, status: 'error', error: `${bin.name}: ${err && err.message ? err.message : err}`});
+        continue;
+      } finally {
+        if (bin.close) bin.close();
+      }
       log.push(`Read ${bin.name} (${bin.size.toLocaleString()} bytes) in the browser. Radar scores come from this .bin.`);
       binsRead.push({name: bin.name, bytes: bin.size, scenarioId: scenarioId});
       radar.push({
@@ -562,12 +586,236 @@
     return {
       sessionId: session,
       files: textFiles.filter(item => !/video_zone/i.test(item.name)).map(item => ({name: item.name, text: item.text})),
-      videos: [],
+      videos: opts.videos,
       radar: radar,
       binsRead: binsRead,
       log: log,
     };
   }
 
-  return {scoreBinFile, reviewFromFiles, fft};
+  /* ---------------------------------------------------------------
+     Inspection report, read in the browser (no review server).
+     Same row rules as scripts/review_server.py: a file's URL is
+     blob_path + sas_token (or any full http URL column), and videos use
+     video_preview_url. Only the files the app uses are downloaded; each
+     .mmwave.bin is streamed once, front to back, straight into
+     scoreBinFile, so a multi-gigabyte room never sits in memory.
+     The blob storage account must allow this site's origin (CORS).
+  --------------------------------------------------------------- */
+  function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let field = '';
+    let quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (quoted) {
+        if (ch === '"' && text[i + 1] === '"') { field += '"'; i++; }
+        else if (ch === '"') quoted = false;
+        else field += ch;
+      } else if (ch === '"') quoted = true;
+      else if (ch === ',') { row.push(field); field = ''; }
+      else if (ch === '\n' || ch === '\r') {
+        if (ch === '\r' && text[i + 1] === '\n') i++;
+        row.push(field); field = '';
+        if (row.some(v => v.trim() !== '')) rows.push(row);
+        row = [];
+      } else field += ch;
+    }
+    row.push(field);
+    if (row.some(v => v.trim() !== '')) rows.push(row);
+    return rows;
+  }
+
+  function normalizeKey(key) {
+    return String(key || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  }
+
+  function reportRows(text, reportName) {
+    const clean = text.replace(/^﻿/, '');
+    const trimmed = clean.trim();
+    let records;
+    if (/\.json$/i.test(reportName || '') || trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      let data = JSON.parse(clean);
+      if (data && !Array.isArray(data)) data = data.files || data.rows || data.value;
+      if (!Array.isArray(data) || !data.length) throw new Error('JSON inspection report must be a list of rows.');
+      records = data;
+    } else {
+      const table = parseCsv(clean);
+      if (table.length < 2) throw new Error('Inspection report has no data rows.');
+      const header = table[0];
+      records = table.slice(1).map(cells => {
+        const obj = {};
+        header.forEach((h, i) => { obj[h] = cells[i]; });
+        return obj;
+      });
+    }
+    return records.map(rec => {
+      const out = {};
+      Object.keys(rec).forEach(k => {
+        const nk = normalizeKey(k);
+        if (nk) out[nk] = rec[k] == null ? '' : String(rec[k]).trim();
+      });
+      return out;
+    });
+  }
+
+  function firstValue(row, keys) {
+    for (const k of keys) if (row[k]) return row[k];
+    return '';
+  }
+
+  function joinBlobUrl(blob, token) {
+    if (!blob || !/^https?:/i.test(blob)) return '';
+    if (!token || /[?&]sig=/.test(blob)) return blob;
+    const t = token.replace(/^\?/, '');
+    return blob + (blob.includes('?') ? '&' : '?') + t;
+  }
+
+  function nameFromUrl(url) {
+    try { return decodeURIComponent(new URL(url).pathname.split('/').pop() || ''); } catch (e) { return ''; }
+  }
+
+  function rowUrl(row) {
+    const hint = firstValue(row, ['filename', 'file_name', 'file', 'name', 'blob_name']);
+    const preview = row.video_preview_url || '';
+    if (/\.(mp4|mov|webm)$/i.test(hint) && /^https?:/i.test(preview)) return preview;
+    for (const k of ['url', 'file_url', 'sas_url', 'download_url', 'blob_url']) {
+      if (/^https?:/i.test(row[k] || '')) return row[k];
+    }
+    const built = joinBlobUrl(row.blob_path || '', row.sas_token || '');
+    if (built) return built;
+    if (/^https?:/i.test(preview)) return preview;
+    for (const v of Object.values(row)) if (/^https?:/i.test(v)) return v;
+    return '';
+  }
+
+  function rowName(row, url) {
+    let name = firstValue(row, ['filename', 'file_name', 'file', 'name', 'blob_name']);
+    if (!name && row.blob_path) name = /^https?:/i.test(row.blob_path) ? nameFromUrl(row.blob_path) : row.blob_path.split('/').pop();
+    if (!name && url) name = nameFromUrl(url);
+    return name;
+  }
+
+  // Text files the app reads. Anything else in the report is left alone.
+  const WANTED_TEXT = /(episode_markers.*\.jsonl|mmwave_sync.*\.json|mmwave\.json|mmwave_segments.*\.json|capture\.json|audit\.json|session_evidence.*\.json|session_validation.*\.json)$/i;
+
+  function fetchFailure(name, err) {
+    const msg = err && err.message ? err.message : String(err);
+    if (err && err.name === 'TypeError') {
+      return `Could not download ${name}. The browser blocked or could not reach it (${msg}). ` +
+        'If the link works when opened directly, the blob storage account needs CORS enabled for this site.';
+    }
+    return `Could not download ${name}: ${msg}`;
+  }
+
+  // A .bin read by streaming one GET. scoreBinFile reads frames in order,
+  // so slice() only ever moves forward; chunks are dropped once consumed.
+  function remoteBinFile(url, name, ids) {
+    const file = Object.assign({name: name, size: 0}, ids || {});
+    let reader = null;
+    let chunks = [];
+    let buffered = 0;
+    let position = 0;
+    let done = false;
+    file.open = async function () {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`download failed (HTTP ${res.status})`);
+      const length = Number(res.headers.get('Content-Length'));
+      if (!length) throw new Error('the storage server did not report the file size');
+      file.size = length;
+      reader = res.body.getReader();
+    };
+    async function take(byteCount) {
+      while (buffered < byteCount && !done) {
+        const step = await reader.read();
+        if (step.done) { done = true; break; }
+        chunks.push(step.value);
+        buffered += step.value.length;
+      }
+      if (buffered < byteCount) throw new Error('download ended before the whole file arrived');
+      const out = new Uint8Array(byteCount);
+      let filled = 0;
+      while (filled < byteCount) {
+        const head = chunks[0];
+        const need = byteCount - filled;
+        if (head.length <= need) {
+          out.set(head, filled);
+          filled += head.length;
+          chunks.shift();
+        } else {
+          out.set(head.subarray(0, need), filled);
+          chunks[0] = head.subarray(need);
+          filled += need;
+        }
+      }
+      buffered -= byteCount;
+      position += byteCount;
+      return out.buffer;
+    }
+    file.slice = function (start, end) {
+      return {
+        arrayBuffer: async function () {
+          if (!reader) throw new Error('file not opened');
+          if (start !== position) throw new Error('radar frames must be read in order');
+          return take(end - start);
+        },
+      };
+    };
+    file.close = function () {
+      if (reader && !done) { try { reader.cancel(); } catch (e) {} }
+      chunks = [];
+      buffered = 0;
+    };
+    return file;
+  }
+
+  async function reviewFromReport(text, reportName, onProgress) {
+    const rows = reportRows(text, reportName);
+    const log = [];
+    const videos = [];
+    const textJobs = [];
+    const bins = [];
+    rows.forEach(row => {
+      const url = rowUrl(row);
+      const name = rowName(row, url);
+      if (!url || !name) {
+        log.push(`Skipped a report row with no file URL (${name || 'unnamed'}).`);
+        return;
+      }
+      const ids = {
+        captureId: firstValue(row, ['capture_id', 'capture']) || captureIdFromName(name),
+        scenarioId: (firstValue(row, ['scenario_id', 'scenario', 'room', 'room_id', 'step_id']) || scenarioIdFromName(name)).toUpperCase(),
+      };
+      if (/\.(mp4|mov|webm)$/i.test(name)) {
+        videos.push({name: name, url: url});
+      } else if (/\.bin$/i.test(name)) {
+        bins.push(remoteBinFile(url, name, ids));
+      } else if (WANTED_TEXT.test(name)) {
+        textJobs.push({name: name, url: url, ids: ids});
+      }
+    });
+    if (onProgress) await onProgress(`Downloading ${textJobs.length} session file(s) listed in the report…`);
+    const texts = [];
+    await Promise.all(textJobs.map(async job => {
+      try {
+        const res = await fetch(job.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.text();
+        texts.push(Object.assign({name: job.name, size: body.length, text: async () => body}, job.ids));
+      } catch (err) {
+        log.push(fetchFailure(job.name, err));
+      }
+    }));
+    if (!bins.length) log.push('The report lists no .mmwave.bin, so no radar scores were filled.');
+    const result = await reviewFromFiles(texts.concat(bins), onProgress, {requireBin: false, videos: videos, log: log});
+    result.radar.forEach(room => {
+      if (room.status === 'error' && /TypeError|Failed to fetch|NetworkError/i.test(room.error || '')) {
+        room.error += ' — if the link works when opened directly, the blob storage account needs CORS enabled for this site.';
+      }
+    });
+    return result;
+  }
+
+  return {scoreBinFile, reviewFromFiles, reviewFromReport, parseCsv, fft};
 });
