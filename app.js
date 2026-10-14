@@ -242,7 +242,7 @@ function classifyAndIngest(filename, text){
     if (!lines.length){ logLine(`<span class="tag warn">unrecognized</span> ${escapeHtml(filename)} (could not parse)`); return; }
     if (lines[0].type && String(lines[0].type).startsWith('capture.episode')){ ingestEpisodeMarkers(lines, filename); return; }
     if (lines[0].schemaVersion === 'hydra.mmwave-tracks/1' || (lines[0].frameIndex != null && 'tracks' in lines[0])){
-      logLine(`<span class="tag warn">skipped</span> ${escapeHtml(filename)} — this is a tracks log, not the raw radar file. Scores come from the room's .mmwave.bin in the inspection report.`);
+      logLine(`<span class="tag warn">skipped</span> ${escapeHtml(filename)} — this is a tracks log, not the raw radar file. Drop the room's .mmwave.bin instead.`);
       return;
     }
     if ('azimuth_deg' in lines[0] && 'in_blue_zone' in lines[0]){
@@ -271,11 +271,21 @@ function ingestVideo(file){
   logLine(`<span class="tag ok">video</span> ${escapeHtml(file.name)} → ${escapeHtml(captureId)}`);
 }
 
+function isVideoFile(file){
+  return file.type.startsWith('video/') || /\.(mp4|mov|webm)$/i.test(file.name);
+}
+function isRadarBin(file){
+  return /\.bin$/i.test(file.name);
+}
+
 async function handleFiles(fileList){
   const files = Array.from(fileList);
+  if (files.some(isRadarBin)){
+    await scoreDroppedFiles(files);
+    return;
+  }
   for (const f of files){
-    const isVideo = f.type.startsWith('video/') || /\.(mp4|mov|webm)$/i.test(f.name);
-    if (isVideo) ingestVideo(f);
+    if (isVideoFile(f)) ingestVideo(f);
     else classifyAndIngest(f.name, await f.text());
   }
   refreshSessionStatus();
@@ -285,6 +295,68 @@ async function handleFiles(fileList){
   renderScenarioTabs();
   renderScenarioShell();
   renderSessionBanner();
+}
+
+async function scoreDroppedFiles(files){
+  const status = document.getElementById('sessionStatus');
+  const drop = document.getElementById('dropzone');
+  const videos = files.filter(isVideoFile);
+  const uploads = files.filter(file => !isVideoFile(file));
+  if (drop) drop.classList.add('busy');
+  if (status) status.textContent = 'Streaming the radar .bin to disk. It is not loaded into browser memory.';
+  const uploadId = crypto.randomUUID();
+  let scored = false;
+  try {
+    for (const file of uploads){
+      if (status) status.textContent = `Streaming ${file.name} (${file.size.toLocaleString()} bytes) to disk…`;
+      const res = await fetch('/api/review/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Upload-Id': uploadId,
+          'X-File-Name': file.name,
+        },
+        body: file,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok){
+        if (status) status.textContent = data.error || `Could not read ${file.name}.`;
+        return;
+      }
+    }
+    if (status) status.textContent = 'Running the radar script on the .bin files…';
+    const res = await fetch('/api/review/score', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uploadId}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok){
+      if (status) status.textContent = data.error || 'The dropped radar files could not be scored.';
+      return;
+    }
+    scored = true;
+    const message = await applyReviewResult(data, 'files');
+    videos.forEach(ingestVideo);
+    refreshSessionStatus();
+    renderScenarioTabs();
+    renderScenarioShell();
+    renderSessionBanner();
+    if (status) status.textContent = message;
+  } catch (err){
+    if (status) status.textContent = 'The review server is not running, so the radar .bin was not read. Start python3 scripts/review_server.py and drop the files again.';
+  } finally {
+    if (!scored){
+      try {
+        await fetch('/api/review/discard', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({uploadId}),
+        });
+      } catch (e){}
+    }
+    if (drop) drop.classList.remove('busy');
+  }
 }
 
 function refreshSessionStatus(){
@@ -1195,6 +1267,45 @@ async function seedAllForms(){
   }
 }
 
+function ensureScenariosFromRadar(rooms){
+  (rooms || []).forEach(room => {
+    if (!room || !room.scenarioId || ingested.scenarios[room.scenarioId]) return;
+    if (!/^(C0|T1-R\d+)$/.test(room.scenarioId)) return;
+    const captureId = (room.bin && deriveCaptureIdFromName(room.bin.name)) || room.scenarioId;
+    ingested.scenarios[room.scenarioId] = {
+      scenarioId: room.scenarioId,
+      roomLabel: room.scenarioId,
+      captureId,
+      startedAt: null,
+      retainedViewCount: null,
+    };
+  });
+}
+
+async function applyReviewResult(data, sourceTag){
+  resetIngested();
+  radarByScenario = indexRadar(data.radar);
+  (data.files || []).forEach(f => classifyAndIngest(f.name, f.text));
+  ensureScenariosFromRadar(data.radar);
+  (data.videos || []).forEach(v => ingestRemoteVideo(v.name, v.url));
+  (data.log || []).forEach(line => logLine(`<span class="tag ok">${escapeHtml(sourceTag)}</span> ${escapeHtml(line)}`));
+  (data.radar || []).filter(room => room.status === 'error').forEach(room => {
+    logLine(`<span class="tag warn">radar</span> ${escapeHtml(room.scenarioId)}: ${escapeHtml(room.error || 'extraction failed')}`);
+  });
+  if (!ingested.sessionId && data.sessionId) ingested.sessionId = data.sessionId;
+  currentScenarioId = getIngestedScenarioIds()[0] || null;
+  await seedAllForms();
+  refreshSessionStatus();
+  renderScenarioTabs();
+  renderScenarioShell();
+  renderSessionBanner();
+  const bins = data.binsRead || [];
+  const listed = bins.map(bin => `${bin.name} (${Number(bin.bytes).toLocaleString()} bytes)`).join('; ');
+  return listed
+    ? `Read ${listed}. Radar scores were filled from those .bin files. Check them, then Save.`
+    : 'No .mmwave.bin was read, so the radar script did not score this session.';
+}
+
 async function beginReview(file){
   const status = document.getElementById('reviewStatus');
   const drop = document.getElementById('reportDrop');
@@ -1211,26 +1322,8 @@ async function beginReview(file){
       if (status) status.textContent = data.error || 'The inspection report could not be processed.';
       return;
     }
-    resetIngested();
-    radarByScenario = indexRadar(data.radar);
-    (data.files || []).forEach(f => classifyAndIngest(f.name, f.text));
-    (data.videos || []).forEach(v => ingestRemoteVideo(v.name, v.url));
-    (data.log || []).forEach(line => logLine(`<span class="tag ok">report</span> ${escapeHtml(line)}`));
-    (data.radar || []).filter(room => room.status === 'error').forEach(room => {
-      logLine(`<span class="tag warn">radar</span> ${escapeHtml(room.scenarioId)}: ${escapeHtml(room.error || 'extraction failed')}`);
-    });
-    if (!ingested.sessionId && data.sessionId) ingested.sessionId = data.sessionId;
-    currentScenarioId = getIngestedScenarioIds()[0] || null;
-    await seedAllForms();
-    refreshSessionStatus();
-    renderScenarioTabs();
-    renderScenarioShell();
-    renderSessionBanner();
-    const bins = data.binsRead || [];
-    const listed = bins.map(bin => `${bin.name} (${Number(bin.bytes).toLocaleString()} bytes)`).join('; ');
-    if (status) status.textContent = listed
-      ? `Read ${listed}. Radar scores were filled from those .bin files. Check them, then Save.`
-      : 'No .mmwave.bin was read, so the radar script did not score this session.';
+    const message = await applyReviewResult(data, 'report');
+    if (status) status.textContent = message;
   } catch (err){
     if (status) status.textContent = 'The review server is not running, so the radar scripts did not run. Start python3 scripts/review_server.py and upload the report again.';
   } finally {
@@ -1250,11 +1343,11 @@ if (reportDrop && reportInput){
 
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('fileInput');
-dropzone.addEventListener('click', () => fileInput.click());
-fileInput.addEventListener('change', e => { if (e.target.files.length) handleFiles(e.target.files); fileInput.value=''; });
+dropzone.addEventListener('click', () => { if (!dropzone.classList.contains('busy')) fileInput.click(); });
+fileInput.addEventListener('change', e => { if (e.target.files.length && !dropzone.classList.contains('busy')) handleFiles(e.target.files); fileInput.value=''; });
 ['dragenter','dragover'].forEach(evt => dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('drag'); }));
 ['dragleave','drop'].forEach(evt => dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('drag'); }));
-dropzone.addEventListener('drop', e => { if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+dropzone.addEventListener('drop', e => { if (e.dataTransfer.files.length && !dropzone.classList.contains('busy')) handleFiles(e.dataTransfer.files); });
 
 document.getElementById('refreshSavedBtn').addEventListener('click', async () => {
   remoteCache = null; // force a fresh fetch instead of reusing whatever was cached

@@ -64,4 +64,4 @@ docs/
 
 ## Radar scoring
 
-Upload an inspection report from **Begin review**. The review server (`python3 scripts/review_server.py`) downloads each room's `.mmwave.bin`, episode markers, and mmwave sync JSON, then runs `scripts/extract_mmwave_diagnostics.py`. Scores are suggestions the reviewer can change before Save. A report with no `.mmwave.bin` is rejected, because there is nothing for the script to score.
+Upload an inspection report from **Begin review**, or drop the files directly. Either way the review server (`python3 scripts/review_server.py`) needs each room's `.mmwave.bin`, episode markers, and mmwave sync JSON, then runs `scripts/extract_mmwave_diagnostics.py`. A direct drop streams the `.bin` to disk in 1 MB chunks; the script memory-maps it, so a multi-gigabyte capture is not loaded into browser or server memory. Files in one drop are matched by capture id or room id in the filename (`c003`, `T1-R1`). Scores are suggestions the reviewer can change before Save. A review with no `.mmwave.bin` is rejected, because there is nothing for the script to score.

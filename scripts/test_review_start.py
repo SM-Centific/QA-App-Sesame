@@ -12,7 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from review_server import prepare_review, ReviewHandler, ROOT  # noqa: E402
+from review_server import (  # noqa: E402
+    BIN_LIMIT,
+    prepare_review,
+    ReviewHandler,
+    ROOT,
+    stream_body_to_file,
+)
 
 
 def build_fixture(directory):
@@ -217,11 +223,81 @@ def main():
     app = urllib.request.urlopen(f"http://127.0.0.1:{port}/app.js", timeout=10).read().decode()
     if "beginReview" not in app or "unit === 'positions'" not in app or "integer ? '1'" not in app:
         raise SystemExit("app.js does not step device placements by 1")
+    if "scoreDroppedFiles" not in app or "/api/review/upload" not in app:
+        raise SystemExit("app.js does not stream a manually dropped .bin")
+    if "streamed to disk" not in index:
+        raise SystemExit("index.html does not explain that a dropped .bin is streamed to disk")
     if "ingestVideoZone" in app or "computeBlueZoneAuto" in app:
         raise SystemExit("video analyzer is still in app.js")
     if not ROOT.endswith("QA-App-Sesame") and not os.path.isdir(ROOT):
         raise SystemExit(f"unexpected root {ROOT}")
     print(f"HTTP review API ok on port {port}")
+    if BIN_LIMIT < 5 * 1024 * 1024 * 1024:
+        raise SystemExit(f"bin limit is below 5 GB: {BIN_LIMIT}")
+
+    class ChunkReader:
+        def __init__(self, payload):
+            self.payload = payload
+            self.offset = 0
+            self.sizes = []
+
+        def read(self, size):
+            self.sizes.append(size)
+            chunk = self.payload[self.offset:self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    payload = b"abc123" * 1000
+    reader = ChunkReader(payload)
+    streamed = "/tmp/review-streamed.bin"
+    written = stream_body_to_file(reader, len(payload), streamed, BIN_LIMIT, chunk_size=1000)
+    if written != len(payload) or open(streamed, "rb").read() != payload:
+        raise SystemExit("streamed upload did not match the source bytes")
+    if any(size > 1000 for size in reader.sizes) or len(reader.sizes) < 6:
+        raise SystemExit(f"upload was not read in small chunks: {reader.sizes}")
+    print(f"streamed {written} bytes in {len(reader.sizes)} chunk(s)")
+
+    import uuid
+    upload_id = str(uuid.uuid4())
+    manual_files = [
+        "P02_scenarioRunner_c003.mmwave.bin",
+        "P02_scenarioRunner_c003.episode_markers.jsonl",
+        "P02_scenarioRunner_c003.mmwave_sync.json",
+        "P02_scenarioRunner_c003.capture.json",
+    ]
+    for name in manual_files:
+        data = (directory / name).read_bytes()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/review/upload",
+            data=data,
+            headers={"X-Upload-Id": upload_id, "X-File-Name": name, "Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            uploaded = json.loads(response.read().decode())
+        if uploaded.get("bytes") != len(data):
+            raise SystemExit(f"upload size mismatch for {name}: {uploaded}")
+    score_request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/review/score",
+        data=json.dumps({"uploadId": upload_id}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(score_request, timeout=120) as response:
+        manual = json.loads(response.read().decode())
+    manual_names = {item["name"] for item in manual["files"]}
+    if "P02_scenarioRunner_c003.capture.json" not in manual_names:
+        raise SystemExit(f"manual upload did not return the capture file: {sorted(manual_names)}")
+    if "P02_scenarioRunner_c003.episode_markers.jsonl" not in manual_names:
+        raise SystemExit(f"manual upload did not return episode markers: {sorted(manual_names)}")
+    bins = manual.get("binsRead") or []
+    if len(bins) != 1 or bins[0]["name"] != "P02_scenarioRunner_c003.mmwave.bin" or bins[0]["scenarioId"] != "T1-R1":
+        raise SystemExit(f"manual bin was not matched to T1-R1: {bins}")
+    room = {item["scenarioId"]: item for item in manual["radar"]}.get("T1-R1")
+    blue = ((room or {}).get("episodes") or [{}])[-1].get("scores", {}).get("blue_zone_pct", {})
+    if not room or room["status"] != "ok" or blue.get("value") != 100:
+        raise SystemExit(f"manual radar score failed: {manual['radar']}")
+    print("manual .bin upload scored")
     fixture.shutdown()
     review.shutdown()
 

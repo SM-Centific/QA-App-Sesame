@@ -18,6 +18,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,8 +30,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 EXTRACT_SCRIPT = os.path.join(os.path.dirname(__file__), "extract_mmwave_diagnostics.py")
 TEXT_LIMIT = 30 * 1024 * 1024
-BIN_LIMIT = 2 * 1024 * 1024 * 1024
+# A room capture can be about 5 GB. The extractor memory-maps the file and
+# both download and manual upload write it to disk in 1 MB chunks, so this
+# cap is a disk limit, not a RAM limit.
+BIN_LIMIT = 8 * 1024 * 1024 * 1024
 REPORT_LIMIT = 8 * 1024 * 1024
+UPLOAD_CHUNK = 1024 * 1024
+UPLOAD_ROOT = os.path.join(tempfile.gettempdir(), "qareview_uploads")
+UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 CAPTURE_RE = re.compile(r"_c(\d{3,})[._]", re.IGNORECASE)
 SCENARIO_RE = re.compile(r"(?:^|[^A-Z0-9])(C0|T1-R\d+)(?:[^A-Z0-9]|$)", re.IGNORECASE)
 
@@ -356,24 +363,113 @@ def prepare_review(filename, raw):
                 else:
                     data = download(item["url"], limit=TEXT_LIMIT)
                     item["text"] = data.decode("utf-8-sig")
-                    kind, parsed = sniff_text(item["name"], item["text"])
-                    if kind == "video_zone":
-                        messages.append(f"Ignored {item['name']}. Video-zone logs are not used. Scores come from each room's .mmwave.bin.")
-                        item["kind"] = "ignored"
-                        continue
-                    item["kind"] = kind
-                    item["parsed"] = parsed
-                    if kind == "capture" and parsed:
-                        item["scenario_id"] = item["scenario_id"] or parsed.get("scenarioId") or ""
-                        item["capture_id"] = item["capture_id"] or capture_id_from_manifest(parsed, item["name"])
-                        item["session_id"] = item["session_id"] or parsed.get("sessionId") or ""
-                    messages.append(f"Read {item['name']} ({kind}).")
+                    adopt_text_item(item, messages)
             except Exception as exc:
                 messages.append(f"Could not read {item['name']}: {exc}")
                 item["error"] = str(exc)
 
-        captures = [item for item in downloaded if item["kind"] == "capture" and item.get("parsed")]
-        for item in downloaded:
+        return finish_review(downloaded, work_dir, files_out, videos_out, radar_out, messages)
+
+
+def stream_body_to_file(rfile, length, dest_path, limit, chunk_size=UPLOAD_CHUNK):
+    """Write a request body to disk without holding the file in memory."""
+    if length <= 0:
+        raise ReportError("Upload is empty.")
+    if length > limit:
+        raise ReportError(f"File exceeds {limit} bytes.")
+    size = 0
+    with open(dest_path, "wb") as handle:
+        remaining = length
+        while remaining:
+            chunk = rfile.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            handle.write(chunk)
+            size += len(chunk)
+            remaining -= len(chunk)
+    if size != length:
+        raise ReportError("Upload ended before the full file arrived.")
+    return size
+
+
+def safe_upload_name(name):
+    name = os.path.basename((name or "").replace("\\", "/").strip())
+    if not name or name in {".", ".."} or "\x00" in name:
+        raise ReportError("File name is not valid.")
+    return name
+
+
+def upload_directory(upload_id):
+    if not UPLOAD_ID_RE.match((upload_id or "").lower()):
+        raise ReportError("Upload id is not valid.")
+    os.makedirs(UPLOAD_ROOT, exist_ok=True)
+    path = os.path.realpath(os.path.join(UPLOAD_ROOT, upload_id.lower()))
+    if os.path.commonpath([os.path.realpath(UPLOAD_ROOT), path]) != os.path.realpath(UPLOAD_ROOT):
+        raise ReportError("Upload id is not valid.")
+    return path
+
+
+def adopt_text_item(item, messages):
+    kind, parsed = sniff_text(item["name"], item["text"])
+    if kind == "video_zone":
+        messages.append(f"Ignored {item['name']}. Video-zone logs are not used. Scores come from each room's .mmwave.bin.")
+        item["kind"] = "ignored"
+        return
+    item["kind"] = kind
+    item["parsed"] = parsed
+    if kind == "capture" and parsed:
+        item["scenario_id"] = item["scenario_id"] or parsed.get("scenarioId") or ""
+        item["capture_id"] = item["capture_id"] or capture_id_from_manifest(parsed, item["name"])
+        item["session_id"] = item["session_id"] or parsed.get("sessionId") or ""
+    messages.append(f"Read {item['name']} ({kind}).")
+
+
+def score_upload_directory(work_dir):
+    downloaded = []
+    messages = []
+    for name in sorted(os.listdir(work_dir)):
+        path = os.path.join(work_dir, name)
+        if not os.path.isfile(path):
+            continue
+        item = {
+            "name": name,
+            "url": "",
+            "session_id": "",
+            "scenario_id": scenario_id_from_name(name),
+            "capture_id": capture_id_from_name(name),
+            "kind": classify_name(name),
+            "text": None,
+            "parsed": None,
+        }
+        if item["kind"] == "bin":
+            item["path"] = path
+            item["size"] = os.path.getsize(path)
+            if item["size"] > BIN_LIMIT:
+                item["error"] = f"File exceeds {BIN_LIMIT} bytes"
+                messages.append(f"Could not read {name}: {item['error']}")
+            else:
+                messages.append(f"Read {name} ({item['size']:,} bytes). Radar scores come from this .bin.")
+        elif item["kind"] == "video":
+            messages.append(f"Ignored {name}. The video stays in the browser for playback.")
+            item["kind"] = "ignored"
+        else:
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read(TEXT_LIMIT + 1)
+                if len(data) > TEXT_LIMIT:
+                    raise RuntimeError(f"File exceeded {TEXT_LIMIT} bytes")
+                item["text"] = data.decode("utf-8-sig")
+                adopt_text_item(item, messages)
+            except Exception as exc:
+                messages.append(f"Could not read {name}: {exc}")
+                item["error"] = str(exc)
+        downloaded.append(item)
+    return finish_review(downloaded, work_dir, [], [], [], messages)
+
+
+def finish_review(downloaded, work_dir, files_out, videos_out, radar_out, messages):
+    captures = [item for item in downloaded if item["kind"] == "capture" and item.get("parsed")]
+    for item in downloaded:
             if item["kind"] != "bin" or item.get("error") or not item.get("path"):
                 continue
             if not item["scenario_id"]:
@@ -425,7 +521,7 @@ def prepare_review(filename, raw):
         detail = (" " + "; ".join(failed)) if failed else ""
         raise ReportError(
             "No radar .mmwave.bin was read, so the script did not score this session. "
-            "The inspection report must include each room's .mmwave.bin, episode markers, and mmwave sync JSON."
+            "Include each room's .mmwave.bin together with its episode markers and mmwave sync JSON."
             + detail
         )
 
@@ -469,29 +565,87 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_POST(self):
-        if urllib.parse.urlparse(self.path).path != "/api/review/start":
-            self.send_error(404)
-            return
+    def _content_length(self):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            return int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            length = 0
+            return 0
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path == "/api/review/start":
+                self._start_report()
+            elif path == "/api/review/upload":
+                self._upload_file()
+            elif path == "/api/review/score":
+                self._score_upload()
+            elif path == "/api/review/discard":
+                self._discard_upload()
+            else:
+                self.send_error(404)
+        except ReportError as exc:
+            self._json(400, {"error": str(exc)})
+        except Exception as exc:
+            log(f"Review failed: {exc}")
+            self._json(500, {"error": "Radar review failed. See the server log for details."})
+
+    def _start_report(self):
+        length = self._content_length()
         if length <= 0 or length > REPORT_LIMIT:
             self._json(413, {"error": "Inspection report is missing or too large."})
             return
         raw = self.rfile.read(length)
         name = self.headers.get("X-Report-Name") or "report.csv"
+        self._json(200, prepare_review(name, raw))
+
+    def _upload_file(self):
+        directory = upload_directory(self.headers.get("X-Upload-Id") or "")
+        name = safe_upload_name(self.headers.get("X-File-Name") or "")
+        length = self._content_length()
+        limit = BIN_LIMIT if classify_name(name) == "bin" else TEXT_LIMIT
+        os.makedirs(directory, exist_ok=True)
+        dest = os.path.join(directory, name)
         try:
-            result = prepare_review(name, raw)
-        except ReportError as exc:
-            self._json(400, {"error": str(exc)})
+            size = stream_body_to_file(self.rfile, length, dest, limit)
+        except Exception:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+        self._json(200, {"name": name, "bytes": size})
+
+    def _score_upload(self):
+        length = self._content_length()
+        if length <= 0 or length > 64 * 1024:
+            self._json(413, {"error": "Score request is missing or too large."})
             return
-        except Exception as exc:
-            log(f"Review failed: {exc}")
-            self._json(500, {"error": "Radar review failed. See the server log for details."})
-            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ReportError("Score request is not valid JSON.") from exc
+        directory = upload_directory(payload.get("uploadId") or "")
+        if not os.path.isdir(directory):
+            raise ReportError("Those files are no longer on disk. Drop them again.")
+        try:
+            result = score_upload_directory(directory)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
         self._json(200, result)
+
+    def _discard_upload(self):
+        length = self._content_length()
+        if length <= 0 or length > 64 * 1024:
+            self._json(400, {"error": "Discard request is missing or too large."})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ReportError("Discard request is not valid JSON.") from exc
+        directory = upload_directory(payload.get("uploadId") or "")
+        shutil.rmtree(directory, ignore_errors=True)
+        self._json(200, {"discarded": True})
 
     def _json(self, status, payload):
         data = json.dumps(payload).encode("utf-8")
