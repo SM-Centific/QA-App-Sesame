@@ -297,12 +297,43 @@ async function handleFiles(fileList){
   renderSessionBanner();
 }
 
+function radarServerMessage(filename){
+  const which = filename ? `${filename} was not read. ` : 'A radar .mmwave.bin cannot be read from this page. ';
+  return `${which}The public site cannot run the radar script. Start python3 scripts/review_server.py and open http://127.0.0.1:8080, then drop the .bin there.`;
+}
+
+async function reviewServerReady(){
+  try {
+    const res = await fetch('/api/review/health', {method: 'GET', cache: 'no-store'});
+    if (!res.ok) return false;
+    const data = await res.json();
+    return !!(data && data.ok);
+  } catch (e){
+    return false;
+  }
+}
+
+async function noteReviewServer(){
+  if (await reviewServerReady()) return;
+  const text = radarServerMessage();
+  const review = document.getElementById('reviewStatus');
+  const session = document.getElementById('sessionStatus');
+  if (review) review.textContent = text;
+  if (session) session.textContent = text;
+}
+
 async function scoreDroppedFiles(files){
   const status = document.getElementById('sessionStatus');
   const drop = document.getElementById('dropzone');
   const videos = files.filter(isVideoFile);
   const uploads = files.filter(file => !isVideoFile(file));
+  const binFile = uploads.find(isRadarBin);
   if (drop) drop.classList.add('busy');
+  if (!(await reviewServerReady())){
+    if (status) status.textContent = radarServerMessage(binFile && binFile.name);
+    if (drop) drop.classList.remove('busy');
+    return;
+  }
   if (status) status.textContent = 'Streaming the radar .bin to disk. It is not loaded into browser memory.';
   const uploadId = crypto.randomUUID();
   let scored = false;
@@ -320,7 +351,7 @@ async function scoreDroppedFiles(files){
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok){
-        if (status) status.textContent = data.error || `Could not read ${file.name}.`;
+        if (status) status.textContent = data.error || radarServerMessage(file.name);
         return;
       }
     }
@@ -1311,6 +1342,11 @@ async function beginReview(file){
   const drop = document.getElementById('reportDrop');
   if (status) status.textContent = 'Reading the inspection report and running radar scoring…';
   if (drop) drop.classList.add('busy');
+  if (!(await reviewServerReady())){
+    if (status) status.textContent = radarServerMessage();
+    if (drop) drop.classList.remove('busy');
+    return;
+  }
   try {
     const res = await fetch('/api/review/start', {
       method: 'POST',
@@ -1425,6 +1461,7 @@ importInput.addEventListener('change', async (e) => {
 function showApp(){
   document.getElementById('accessGate').style.display = 'none';
   document.getElementById('appRoot').style.display = '';
+  noteReviewServer();
 }
 
 async function attemptAccess(email){
