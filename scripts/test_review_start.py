@@ -223,14 +223,19 @@ def main():
     app = urllib.request.urlopen(f"http://127.0.0.1:{port}/app.js", timeout=10).read().decode()
     if "beginReview" not in app or "unit === 'positions'" not in app or "integer ? '1'" not in app:
         raise SystemExit("app.js does not step device placements by 1")
-    if "scoreDroppedFiles" not in app or "/api/review/upload" not in app:
+    if "scoreDroppedFiles" not in app or "/api/review/upload" not in app or "/api/review/health" not in app:
         raise SystemExit("app.js does not stream a manually dropped .bin")
+    if "Could not read ${file.name}" in app:
+        raise SystemExit("app.js still hides a failed .bin read")
     if "streamed to disk" not in index:
         raise SystemExit("index.html does not explain that a dropped .bin is streamed to disk")
     if "ingestVideoZone" in app or "computeBlueZoneAuto" in app:
         raise SystemExit("video analyzer is still in app.js")
     if not ROOT.endswith("QA-App-Sesame") and not os.path.isdir(ROOT):
         raise SystemExit(f"unexpected root {ROOT}")
+    health = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/review/health", timeout=10).read().decode())
+    if health.get("ok") is not True:
+        raise SystemExit(f"health check failed: {health}")
     print(f"HTTP review API ok on port {port}")
     if BIN_LIMIT < 5 * 1024 * 1024 * 1024:
         raise SystemExit(f"bin limit is below 5 GB: {BIN_LIMIT}")
@@ -298,6 +303,46 @@ def main():
     if not room or room["status"] != "ok" or blue.get("value") != 100:
         raise SystemExit(f"manual radar score failed: {manual['radar']}")
     print("manual .bin upload scored")
+
+    c004_bin = directory / "P02_scenarioRunner_c004.mmwave.bin"
+    c004_bin.write_bytes((directory / "P02_scenarioRunner_c003.mmwave.bin").read_bytes())
+    for src, dest in (
+        ("P02_scenarioRunner_c003.episode_markers.jsonl", "P02_scenarioRunner_c004.episode_markers.jsonl"),
+        ("P02_scenarioRunner_c003.mmwave_sync.json", "P02_scenarioRunner_c004.mmwave_sync.json"),
+        ("P02_scenarioRunner_c003.capture.json", "P02_scenarioRunner_c004.capture.json"),
+    ):
+        text = (directory / src).read_text().replace("c003", "c004").replace("T1-R1", "T1-R2")
+        (directory / dest).write_text(text)
+    c004_id = str(uuid.uuid4())
+    for name in (
+        "P02_scenarioRunner_c004.mmwave.bin",
+        "P02_scenarioRunner_c004.episode_markers.jsonl",
+        "P02_scenarioRunner_c004.mmwave_sync.json",
+        "P02_scenarioRunner_c004.capture.json",
+    ):
+        data = (directory / name).read_bytes()
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/review/upload",
+            data=data,
+            headers={"X-Upload-Id": c004_id, "X-File-Name": name, "Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            uploaded = json.loads(response.read().decode())
+        if uploaded.get("name") != name:
+            raise SystemExit(f"c004 upload rejected {name}: {uploaded}")
+    score_request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/review/score",
+        data=json.dumps({"uploadId": c004_id}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(score_request, timeout=120) as response:
+        c004 = json.loads(response.read().decode())
+    c004_bins = c004.get("binsRead") or []
+    if len(c004_bins) != 1 or c004_bins[0].get("scenarioId") != "T1-R2":
+        raise SystemExit(f"c004 bin was not read: {c004_bins} log={c004.get('log')}")
+    print("c004 .bin upload scored")
     fixture.shutdown()
     review.shutdown()
 

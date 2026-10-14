@@ -549,6 +549,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/review/health":
+            self._json(200, {"ok": True, "binLimit": BIN_LIMIT})
+            return
         if path == "/":
             path = "/index.html"
         rel = path.lstrip("/")
