@@ -12,6 +12,9 @@ page in headless Chromium through each input path:
   * server  / report  - review_server.py running, inspection CSV uploaded
   * public  / no-cors - static hosting, blob host without CORS: expect a clear
                         message naming CORS instead of silent empty scores
+  * <host>  / split   - files dropped by hand in separate batches: C0 metadata
+                        then its .bin; the T1 .bin before its metadata. Each
+                        drop must add to what is loaded, not wipe it
   * <host>  / daily   - a daily report with two sessions (session taken from the
                         UUID in each blob path): pick the second one; only its
                         files may be downloaded and it must load as its own session
@@ -162,10 +165,21 @@ def run_case(browser, app_url, mode, fixture, report="inspection_report.csv"):
     page.fill("#accessEmail", "tester@centific.com")
     page.click("#accessSubmit")
     page.wait_for_selector("#appRoot", state="visible")
+    meta = (".episode_markers.jsonl", ".mmwave_sync.json", ".capture.json")
     if mode == "files":
         files = [str(fixture / f"{stem}{ext}") for stem in (STEM, C0_STEM) for ext in
-                 (".mmwave.bin", ".episode_markers.jsonl", ".mmwave_sync.json", ".capture.json")]
+                 (".mmwave.bin",) + meta]
         page.set_input_files("#fileInput", files)
+        status_sel = "#sessionStatus"
+    elif mode == "split":
+        def drop(paths):
+            page.set_input_files("#fileInput", [str(fixture / x) for x in paths])
+            page.wait_for_function("!document.getElementById('dropzone').classList.contains('busy')", timeout=120000)
+            page.wait_for_timeout(300)
+        drop([C0_STEM + e for e in meta])
+        drop([C0_STEM + ".mmwave.bin"])
+        drop([STEM + ".mmwave.bin"])          # before its metadata
+        drop([STEM + e for e in meta])        # triggers a re-read of that .bin
         status_sel = "#sessionStatus"
     else:
         page.set_input_files("#reportInput", str(fixture / report))
@@ -286,7 +300,7 @@ def main():
         hosts.append(("server", f"http://127.0.0.1:{port}/", proc))
 
     failures = 0
-    cases = [(h, m) for h in hosts for m in ("files", "report")]
+    cases = [(h, m) for h in hosts for m in ("files", "split", "report")]
     with sync_playwright() as p:
         browser = p.chromium.launch()
         for (name, url, _), mode in tqdm(cases, desc="app paths", unit="path"):
