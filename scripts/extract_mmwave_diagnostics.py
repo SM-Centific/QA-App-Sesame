@@ -282,6 +282,63 @@ def parse_args():
     return p.parse_args()
 
 
+def rig_motion_by_episode(background_series, episode_windows, framerate, warmup_frames,
+                          ratio=1.2, smooth_frames=10, edge_s=5.0):
+    """
+    How much the RIG ITSELF moved in each episode (used for C0 scoring).
+
+    When the radar is moved, every static reflector in the room shifts
+    relative to it, so the clutter-subtracted background energy rises across
+    the whole scene; while the rig is at rest the clutter map cancels the
+    room and it settles back. A frame counts as "rig moving" when its
+    (1-second rolling median) background energy is more than `ratio` times
+    the at-rest baseline. The baseline is the median over the frames after
+    warm-up and before the first episode starts (the operator starts the
+    episode with the platform stable); without enough of those, the 20th
+    percentile of the episode's own frames is used instead.
+
+    Validated on ONE real C0 capture (c002, session 2fca9f97): first and last
+    5 s of the episode read 0% moving, the middle 68%, and no pre-episode
+    frame was flagged. Provisional until checked on more captures.
+    """
+    if not episode_windows or not background_series:
+        return {}
+    bg = np.array(background_series, dtype=float)
+    bg[:warmup_frames] = np.nan
+    half = smooth_frames // 2
+    smooth = np.array([np.nanmedian(bg[max(0, i - half):i + half]) if np.any(~np.isnan(bg[max(0, i - half):i + half])) else np.nan
+                       for i in range(len(bg))])
+    times = np.arange(len(bg)) / framerate
+    first_start = min(w["start_time_s"] for w in episode_windows)
+    pre = bg[(times >= warmup_frames / framerate + 1.0) & (times < first_start - 0.5)]
+    pre = pre[~np.isnan(pre)]
+    out = {}
+    for w in episode_windows:
+        inside = (times >= w["start_time_s"]) & (times <= w["end_time_s"]) & ~np.isnan(smooth)
+        if not np.any(inside):
+            continue
+        if len(pre) >= 10:
+            baseline, source = float(np.median(pre)), "before_first_episode"
+        else:
+            baseline, source = float(np.percentile(smooth[inside], 20)), "episode_low_20pct"
+        if baseline <= 0:
+            continue
+        moving = smooth > ratio * baseline
+
+        def pct(mask):
+            m = inside & mask
+            return round(100.0 * float(np.sum(moving & m)) / float(np.sum(m)), 1) if np.any(m) else None
+
+        out[w["episode_id"]] = {
+            "baseline_energy": round(baseline, 1), "baseline_source": source, "ratio": ratio, "edge_s": edge_s,
+            "moving_pct": pct(np.ones_like(inside)),
+            "moving_pct_first_edge": pct(times < w["start_time_s"] + edge_s),
+            "moving_pct_last_edge": pct(times > w["end_time_s"] - edge_s),
+            "moving_pct_middle": pct((times >= w["start_time_s"] + edge_s) & (times <= w["end_time_s"] - edge_s)),
+        }
+    return out
+
+
 def estimate_azimuth_deg(phase_diff_1_deg, phase_diff_2_deg, wavelength_m, antenna_spacing_m):
     """
     Standard phase-interferometry angle-of-arrival. The PRIMARY (and only
@@ -321,7 +378,7 @@ def estimate_azimuth_deg(phase_diff_1_deg, phase_diff_2_deg, wavelength_m, anten
 def new_accumulator():
     return {
         "total_frames": 0, "frames_tracked": 0, "frames_searching": 0, "frames_moving": 0,
-        "zone_counts": {"blue": 0, "orange": 0, "neither": 0},
+        "zone_counts": {"blue": 0, "orange": 0, "outside_far": 0, "neither": 0},
         "tracked_ranges_m": [], "implied_speeds_mps": [], "first_lock": None,
     }
 
@@ -364,6 +421,7 @@ def summarize_accumulator(acc, extra_fields=None):
         "zone_pct_of_tracked_frames": {
             "blue": round(100 * zc["blue"] / tracked_or_1, 1),
             "orange": round(100 * zc["orange"] / tracked_or_1, 1),
+            "outside_far": round(100 * zc["outside_far"] / tracked_or_1, 1),
             "neither": round(100 * zc["neither"] / tracked_or_1, 1),
         },
         # Measured against TRACKED frames only, same reasoning as
@@ -399,6 +457,11 @@ def classify_zone(range_m, azimuth_deg, blue_max_range, orange_max_range, fronta
         return "blue"
     if (not in_front) and range_m <= orange_max_range:
         return "orange"
+    if not in_front:
+        # Outside the forward view AND past the 3 m warning line. The
+        # collection runbook asks people to make only brief exits within
+        # 2 m and to turn back before 3 m -- lingering here is the fault.
+        return "outside_far"
     return "neither"
 
 
@@ -511,6 +574,8 @@ def main():
     position_tail_energies = {w["episode_id"]: [] for w in episode_windows}
     position_head_energies = {w["episode_id"]: [] for w in episode_windows}
 
+    background_series = []  # one value per frame, for rig_motion_by_episode()
+
     rows_written = 0
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -558,6 +623,7 @@ def main():
             full_doppler_slice = slice(0, num_chirps)
             usable_full = mag_moving[:, min_range_bin:num_samples // 2]
             background_energy = float(np.median(usable_full[usable_full > 0])) if np.any(usable_full > 0) else 0.0
+            background_series.append(background_energy)
 
             candidate = None  # (doppler_idx, range_idx, peak_energy, snr_db)
             track_state = "searching"
@@ -811,6 +877,7 @@ def main():
 
     episodes_summary_path = None
     if episode_windows:
+        rig_motion = rig_motion_by_episode(background_series, episode_windows, args.framerate, args.warmup)
         episodes_out = []
         for w in episode_windows:
             acc = episode_accumulators[w["episode_id"]]
@@ -820,6 +887,7 @@ def main():
                 "duration_ms": w["duration_ms"], "within_duration_tolerance": w["within_duration_tolerance"],
                 "invalid_reasons": w["invalid_reasons"],
                 "start_time_s": round(w["start_time_s"], 3), "end_time_s": round(w["end_time_s"], 3),
+                "rig_motion": rig_motion.get(w["episode_id"]),
             })
             episodes_out.append(ep_summary)
         episodes_summary_path = out_path.rsplit(".csv", 1)[0] + ".episodes.json"
@@ -831,6 +899,7 @@ def main():
           f"({summary_out['pct_searching']}% had no confident detection)")
     print(f"Zone split (of tracked frames): blue={summary_out['zone_pct_of_tracked_frames']['blue']}%  "
           f"orange={summary_out['zone_pct_of_tracked_frames']['orange']}%  "
+          f"outside_far={summary_out['zone_pct_of_tracked_frames']['outside_far']}%  "
           f"neither={summary_out['zone_pct_of_tracked_frames']['neither']}%")
     print(f"Distance variance: {summary_out['distance_variance_m']}m  "
           f"(mean range {summary_out['mean_range_m']}m, median {summary_out['median_range_m']}m)")

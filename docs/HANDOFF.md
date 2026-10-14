@@ -115,7 +115,7 @@ ITEMS_TECHNICAL = [
 ITEMS_PARTICIPANT = [
   continuous_movement: percent, P0, direction: higher_is_better, unit: '%',
   blue_zone_pct:       percent, P1, direction: higher_is_better, unit: '%',
-  orange_zone:         percent, P1, direction: lower_is_better,  unit: '%',
+  outside_far:         percent, P1, direction: lower_is_better,  referenceValue: 10, unit: '%',   (replaced orange_zone 2026-10-14)
   speed_variance:      scale (1/2/3), P1,
   distance_variance:   scale (1/2/3), P1,
 ]
@@ -131,6 +131,16 @@ Rows saved before this change hold the raw measurement; the app converts
 them with the same buckets on load, and new rows carry `scoreVersion: 2`.
 `PopulateScorecard.ts` must make the same change (treat these two as
 `scale`) or it will read a 1/2/3 as metres.
+
+**2026-10-14, from the collection runbook:** Orange Zone (outside the forward
+view within 3 m, lower is better) was replaced by `outside_far` — outside
+the view AND past the 3 m warning line, ≤10% passes. The runbook asks for
+brief exits within 2 m, so those are no longer penalised. The radar scripts
+now report an `outside_far` zone alongside blue/orange/neither ("neither"
+is now only inside the view beyond 5 m). C0 static/figure-8/translation
+are suggested from a new per-episode `rig_motion` block (rise in
+clutter-subtracted background energy while the rig is moved).
+`PopulateScorecard.ts` needs `outside_far` in place of `orange_zone`.
 
 ### `toPct(item, rawValue)` — identical logic in both `app.js` and
 `PopulateScorecard.ts`, verified byte-for-byte identical by compiling and
