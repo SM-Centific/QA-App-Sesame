@@ -19,11 +19,13 @@ const ITEMS_TECHNICAL = [
   {id:'video_quality', label:'Video Quality', priority:'P1', kind:'scale', help:'Exposure, focus, framing, dropped frames.'},
 ];
 const ITEMS_PARTICIPANT = [
-  {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', unit:'%', help:'% of the episode spent in motion (target >75%) — measured from the room\'s radar .mmwave.bin when the inspection report includes it.'},
+  {id:'pii', label:'PII visible', priority:'P0', kind:'flag', failOn:'yes', defaultValue:'no', help:'Anything that identifies someone who has not consented, or private information: an unconsented face, a screen, documents, a name badge, a licence plate. Yes fails the episode, whatever its other scores.'},
+  {id:'continuous_movement', label:'Continuous Movement', priority:'P0', kind:'percent', direction:'higher_is_better', referenceValue:75, unit:'%', help:'% of the episode spent in motion (passes at 75% or more) — measured from the room\'s radar .mmwave.bin when the inspection report includes it.'},
   {id:'blue_zone_pct', label:'Blue Zone %', priority:'P1', kind:'percent', direction:'higher_is_better', unit:'%', help:'Time spent inside the 120°×5m forward FOV — measured from the room\'s radar .mmwave.bin.'},
   {id:'outside_far', label:'Outside view beyond 3 m %', priority:'P1', kind:'percent', direction:'lower_is_better', referenceValue:10, unit:'%', help:'Time spent outside the 120° forward view AND past the 3 m warning line — the runbook says turn back before 3 m and do not linger. Brief exits within 3 m are expected and not penalised. Lower is better; ≤10% passes. Measured from the room\'s radar .mmwave.bin.'},
   {id:'speed_variance', label:'Speed Variance', priority:'P1', kind:'scale', help:'Natural variation in movement speed — more is better (not robotic/staged). 1 = little or none · 2 = some · 3 = great, clearly natural. Suggested from the radar\'s speed spread when available.'},
   {id:'distance_variance', label:'Distance Variance', priority:'P1', kind:'scale', help:'Natural variation in near/far distance — more is better (not robotic/staged). 1 = little or none · 2 = some · 3 = great, clearly natural. Suggested from the radar\'s distance spread when available.'},
+  {id:'moderator_visible', label:'Moderator visible and moving', priority:'P1', kind:'yesno', help:'Yes when the moderator stays visible to the camera and keeps moving naturally through the episode (not standing static). No pulls the P1 score down but does not fail the episode on its own.'},
 ];
 
 // Radar measurement -> suggested 1/2/3 for the two variance items. The
@@ -104,6 +106,10 @@ let localScores = {};
 // radar / automatic suggestions show instead. Saved notes are kept. Cleared
 // whenever a session is (re)loaded.
 let ignoreSavedScoresFor = null;
+// The reviewer's session decision (pass/fail). Required before Save; saved
+// as its own row (kind 'session') so the production tracker can read it.
+let sessionDecision = null; // {decision: 'pass'|'fail', savedAt, decidedBy, dirty}
+function sessionDocId(){ return `${ingested.sessionId}__session`; }
 let dbNS = null, downloadsNS = null;
 let videoEl = null; // live reference to the <video> element, persists across episode/scope changes
 let activeVideoObj = null; // whichever videosByCapture entry currently holds a live blob URL, if any
@@ -783,6 +789,7 @@ function docIdFor(d){
   if (d.kind === 'technical') return `${d.sessionId}__${d.scenarioId}__technical`;
   if (d.kind === 'participant') return `${d.sessionId}__${d.scenarioId}__ep__${d.episodeId}`;
   if (d.kind === 'annotations') return `${d.sessionId}__${d.scenarioId}__annotations`;
+  if (d.kind === 'session') return `${d.sessionId}__session`;
   return null;
 }
 
@@ -808,7 +815,9 @@ function docIdFor(d){
      threshold (85 for P0, 75 for P1) instead — goodness equals exactly
      that threshold right at referenceValue, scaling up/down around it. */
 function toPct(it, v){
-  if (v == null) return null;
+  if (v == null || v === '') return null;
+  if (it.kind === 'yesno') return v === 'yes' ? 100 : v === 'no' ? 0 : null;
+  if (it.kind === 'flag' || it.kind === 'gate') return null; // pass/fail only, never averaged
   if (it.kind !== 'percent') return v / 3 * 100; // unchanged: 1-3 manual scale
   const dir = it.direction || 'higher_is_better';
   if (it.referenceValue == null) return dir === 'lower_is_better' ? (100 - v) : v;
@@ -824,6 +833,7 @@ function computeScores(items, values){
   items.forEach(it => {
     const v = values[it.id];
     if (it.kind === 'gate'){ if (v === 'fail') gateFailed = true; }
+    else if (it.kind === 'flag'){ if (v === it.failOn) gateFailed = true; }
     else {
       const pct = toPct(it, v);
       if (pct != null) (it.priority === 'P0' ? p0 : p1).push(pct);
@@ -847,13 +857,9 @@ function computeScores(items, values){
 function blendedRoomQuality(technicalValues, participantDocs){
   const p0vals = []; const p1vals = [];
   ITEMS_TECHNICAL.forEach(it => { const pct = toPct(it, technicalValues[it.id]); if (pct != null) (it.priority==='P0'?p0vals:p1vals).push(pct); });
-  const avgOf = key => {
-    const nums = participantDocs.map(d => scoresOf(d)[key]).filter(v => v != null);
-    return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null;
-  };
   ITEMS_PARTICIPANT.forEach(it => {
-    const raw = avgOf(it.id);
-    if (raw != null) (it.priority==='P0'?p0vals:p1vals).push(toPct(it, raw));
+    const pcts = participantDocs.map(d => toPct(it, scoresOf(d)[it.id])).filter(v => v != null);
+    if (pcts.length) (it.priority==='P0'?p0vals:p1vals).push(pcts.reduce((a,b)=>a+b,0)/pcts.length);
   });
   const avg = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
   return {p0Pct: avg(p0vals), p1Pct: avg(p1vals)};
@@ -867,7 +873,10 @@ async function computeRoomGate(scenarioId){
   if (!scenario) return null;
   const techDocId = `${ingested.sessionId}__${scenarioId}__technical`;
   const techSaved = await loadDoc(techDocId);
-  const techValues = (techSaved && techSaved.scores) || {};
+  // Scores on screen (saved or not) win over the saved copy, so the
+  // recommendation is current before the reviewer has saved anything.
+  const techForm = formCache[techDocId];
+  const techValues = techForm ? techForm.values : ((techSaved && techSaved.scores) || {});
   const techScores = computeScores(ITEMS_TECHNICAL, techValues);
   const allDocs = await queryAll();
   const episodes = ingested.episodesByCapture[scenario.captureId] || [];
@@ -878,13 +887,22 @@ async function computeRoomGate(scenarioId){
   // (collection runbook), so it can't count toward the room's minimum
   // either. Without episode markers loaded, every row for the room counts.
   const retainedIds = new Set(retained.map(e => e.episodeId));
-  const participantDocs = allDocs.filter(d =>
+  const savedDocs = allDocs.filter(d =>
     d.kind === 'participant' && d.scenarioId === scenarioId && d.sessionId === ingested.sessionId
     && (!episodes.length || retainedIds.has(d.episodeId)));
+  const byEpisode = {};
+  savedDocs.forEach(d => { byEpisode[d.episodeId] = d; });
+  Object.values(formCache).forEach(f => {
+    if (f.kind !== 'participant' || f.scenarioId !== scenarioId) return;
+    if (episodes.length && !retainedIds.has(f.episodeId)) return;
+    byEpisode[f.episodeId] = {episodeId: f.episodeId, scores: f.values, scoreVersion: SCORE_VERSION,
+      overall: computeScores(ITEMS_PARTICIPANT, f.values).overall};
+  });
+  const participantDocs = Object.values(byEpisode);
   const passedCount = participantDocs.filter(d => d.overall === 'pass').length;
   const meetsMinimum = passedCount >= MIN_GOOD_EPISODES;
   const technicalOk = !techScores.gateFailed && (techScores.p0Pct == null || techScores.p0Pct >= 85) && (techScores.p1Pct == null || techScores.p1Pct >= 75);
-  const hasAnyData = !!techSaved || participantDocs.length > 0;
+  const hasAnyData = !!techSaved || !!techForm || participantDocs.length > 0;
   const blended = blendedRoomQuality(techValues, participantDocs);
   return {
     scenarioId, roomLabel: scenario.roomLabel,
@@ -897,9 +915,11 @@ async function computeRoomGate(scenarioId){
 
 async function computeC0Gate(){
   if (!ingested.sessionId) return null;
-  const saved = await loadDoc(`${ingested.sessionId}__C0__form`);
-  if (!saved) return {gatePass: null, p0Pct: null};
-  const scores = computeScores(ITEMS_C0, saved.scores || {});
+  const docId = `${ingested.sessionId}__C0__form`;
+  const form = formCache[docId];
+  const saved = form ? null : await loadDoc(docId);
+  if (!form && !saved) return {gatePass: null, p0Pct: null};
+  const scores = computeScores(ITEMS_C0, form ? form.values : (saved.scores || {}));
   const gatePass = !scores.gateFailed && (scores.p0Pct == null ? null : scores.p0Pct >= 85);
   return {gatePass, p0Pct: scores.p0Pct, gateFailed: scores.gateFailed};
 }
@@ -911,14 +931,35 @@ async function computeSessionSummary(){
   const rooms = await Promise.all(roomIds.map(computeRoomGate));
   const anyLoaded = getIngestedScenarioIds().length > 0;
   if (!anyLoaded) return null;
-  const gates = [c0 ? c0.gatePass : null, ...rooms.map(r => r ? r.gatePass : null)];
+  // C0 must pass. Each T1 room is kept if it qualifies (technical thresholds
+  // and at least MIN_GOOD_EPISODES passing episodes) and rejected if not;
+  // the session passes as long as at least one room is kept. With a single
+  // room, that room failing rejects the session.
+  const c0Pass = c0 ? c0.gatePass : null;
+  const kept = [], rejected = [], pending = [];
+  roomIds.forEach((id, i) => {
+    const g = rooms[i] ? rooms[i].gatePass : null;
+    (g === true ? kept : g === false ? rejected : pending).push(id);
+  });
   let sessionPass = 'incomplete';
-  if (gates.some(g => g === false)) sessionPass = 'fail';
-  else if (gates.every(g => g === true)) sessionPass = 'pass';
+  let reason = '';
+  if (c0Pass === false){ sessionPass = 'fail'; reason = 'C0 failed'; }
+  else if (roomIds.length && rejected.length === roomIds.length){
+    sessionPass = 'fail';
+    reason = roomIds.length === 1 ? `${roomIds[0]} rejected (needs ${MIN_GOOD_EPISODES} passing episodes)` : `every T1 room rejected (each needs ${MIN_GOOD_EPISODES} passing episodes)`;
+  }
+  else if (c0Pass === true && kept.length){ sessionPass = 'pass'; }
+  else {
+    const waiting = [c0Pass == null ? 'C0' : null].concat(pending).filter(Boolean);
+    reason = waiting.length ? `waiting on ${waiting.join(', ')}` : 'no T1 room loaded';
+  }
+  if (sessionPass === 'pass'){
+    reason = `C0 passed · kept ${kept.join(', ')}` + (rejected.length ? ` · rejected ${rejected.join(', ')}` : '') + (pending.length ? ` · not scored yet ${pending.join(', ')}` : '');
+  }
   const avgOf = arr => { const nums = arr.filter(v => v != null); return nums.length ? nums.reduce((a,b)=>a+b,0)/nums.length : null; };
   const sessionP0 = avgOf([c0 ? c0.p0Pct : null, ...rooms.map(r => r ? r.blendedP0Pct : null)]);
   const sessionP1 = avgOf(rooms.map(r => r ? r.blendedP1Pct : null)); // C0 has no P1 pool
-  return {sessionPass, sessionP0, sessionP1, c0, rooms, roomIds};
+  return {sessionPass, reason, kept, rejected, pending, sessionP0, sessionP1, c0, rooms, roomIds};
 }
 
 /* ---------------------------------------------------------------
@@ -963,15 +1004,42 @@ async function renderSessionBanner(){
   const pillsHtml = pillPairs
     .map(([label, g]) => {
       const state = !g ? 'incomplete' : (g.gatePass === true ? 'pass' : g.gatePass === false ? 'fail' : 'incomplete');
-      return `<span class="gate-pill ${state}">${label}</span>`;
+      const title = label === 'C0'
+        ? (state === 'pass' ? 'C0 passed' : state === 'fail' ? 'C0 failed — the session fails' : 'C0 not scored yet')
+        : (state === 'pass' ? `${label} kept` : state === 'fail' ? `${label} rejected` : `${label} not scored yet`);
+      return `<span class="gate-pill ${state}" title="${escapeHtml(title)}">${label}${label !== 'C0' && state === 'fail' ? ' ✕' : ''}</span>`;
     }).join('');
+  const d = sessionDecision && sessionDecision.decision;
+  const decidedNote = !d ? 'Choose before saving'
+    : sessionDecision.dirty ? 'Not saved yet'
+    : `Saved${sessionDecision.decidedBy ? ' by ' + escapeHtml(sessionDecision.decidedBy) : ''}`;
   el.innerHTML = `
     <div class="scope-badge session">SESSION</div>
     <div class="session-banner-row">
       <div class="gate-pills">${pillsHtml}</div>
       <div class="session-nums">P0 avg ${fmtPct(summary.sessionP0)} · P1 avg ${fmtPct(summary.sessionP1)}</div>
-      <div class="overall-badge ${summary.sessionPass}">${summary.sessionPass.toUpperCase()}</div>
+    </div>
+    <div class="session-decision-row" id="sessionDecisionRow">
+      <div class="session-rec">
+        <span class="rec-label">Recommended</span>
+        <span class="overall-badge ${summary.sessionPass}">${summary.sessionPass.toUpperCase()}</span>
+        <span class="rec-reason">${escapeHtml(summary.reason || '')}</span>
+      </div>
+      <div class="session-decide">
+        <span class="rec-label">Your decision</span>
+        <div class="seg-group" role="group" aria-label="Session decision">
+          <button type="button" class="seg ${d === 'pass' ? 'active pass' : ''}" data-decision="pass">Pass</button>
+          <button type="button" class="seg ${d === 'fail' ? 'active fail' : ''}" data-decision="fail">Fail</button>
+        </div>
+        <span class="decision-note">${decidedNote}</span>
+      </div>
     </div>`;
+  el.querySelectorAll('[data-decision]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      sessionDecision = Object.assign({}, sessionDecision || {}, {decision: btn.dataset.decision, dirty: true});
+      renderSessionBanner();
+    });
+  });
 }
 
 /* ---------------------------------------------------------------
@@ -1043,7 +1111,15 @@ function itemRowHtml(it, value, auto){
   const noteHtml = (auto && auto.note) ? `<div class="item-note">${escapeHtml(auto.note)}</div>` : '';
   const coverageHtml = (auto && auto.coveragePct != null) ? `<div class="item-note">detector confidence: ${auto.coveragePct.toFixed(0)}% of frames had a detection</div>` : '';
   let control;
-  if (it.kind === 'gate'){
+  if (it.kind === 'flag'){
+    const on = value === it.failOn;
+    control = `<button type="button" class="flip ${on ? 'on' : ''}" role="switch" aria-checked="${on}" aria-label="${escapeHtml(it.label)}" data-item="${it.id}" data-value="${on ? 'no' : 'yes'}">
+      <span class="flip-track"><span class="flip-knob"></span></span>
+      <span class="flip-label">${on ? 'Yes — this episode fails' : 'No'}</span>
+    </button>`;
+  } else if (it.kind === 'yesno'){
+    control = ['yes','no'].map(v => `<button type="button" class="seg ${value===v ? 'active ' + (v==='yes'?'pass':'fail') : ''}" data-item="${it.id}" data-value="${v}">${v==='yes'?'Yes':'No'}</button>`).join('');
+  } else if (it.kind === 'gate'){
     control = ['pass','fail'].map(v => `<button type="button" class="seg ${value===v?'active '+v:''}" data-item="${it.id}" data-value="${v}">${v==='pass'?'Pass':'Fail'}</button>`).join('');
   } else if (it.kind === 'percent' && (it.unit || '%') === '%'){
     control = percentMeterHtml(it, value, auto);
@@ -1081,7 +1157,7 @@ async function ensureFormLoaded(docId, items, kind, scenarioId, episodeId, autos
     if (legacy && VARIANCE_BUCKETS[it.id] && saved.scores[it.id] != null) values[it.id] = varianceBucket(it.id, saved.scores[it.id]);
     else if (saved && saved.scores && saved.scores[it.id] != null) values[it.id] = saved.scores[it.id];
     else if (autos[it.id] && autos[it.id].value != null) values[it.id] = autos[it.id].value;
-    else values[it.id] = null;
+    else values[it.id] = it.defaultValue != null ? it.defaultValue : null;
   });
   formCache[docId] = {docId, items, kind, scenarioId, episodeId, values, autos, notes: (saved && saved.notes) || '', savedAt: (saved && saved.savedAt) || null};
   return formCache[docId];
@@ -1168,7 +1244,7 @@ async function renderScenarioShell(){
         ${videoHtml}
         ${episodeSelectHtml}
         <div class="annotation-panel" id="annotationPanel">
-          <div class="panel-title">Video annotations <span id="annotationCount"></span></div>
+          <div class="panel-title">Video annotations <span id="annotationCount"></span> <a class="panel-help" href="help.html#flags" target="_blank" rel="noopener">When to flag ↗</a></div>
           <div class="annotation-add-row">
             <button class="btn" id="addFlagBtn">⚑ Flag moment</button>
             <button class="btn" id="addCommentBtn">💬 Add comment</button>
@@ -1278,6 +1354,10 @@ async function renderScenarioShell(){
    the video element.
 --------------------------------------------------------------- */
 async function renderScoringSection(){
+  await renderScoringSectionInner();
+  renderSessionBanner(); // keep the recommendation current as scores change
+}
+async function renderScoringSectionInner(){
   const el = document.getElementById('scoringSection');
   if (!el || !currentScenarioId || !ingested.scenarios[currentScenarioId]) return;
   const scenario = ingested.scenarios[currentScenarioId];
@@ -1377,11 +1457,11 @@ function captureActiveNotes(){
 function wireItemInputs(containerId, docId, items, kind, scenarioId, episodeId){
   const container = document.getElementById(containerId);
   if (!container) return;
-  container.querySelectorAll('.seg').forEach(btn => {
+  container.querySelectorAll('.seg, .flip').forEach(btn => {
     btn.addEventListener('click', () => {
       const itemId = btn.dataset.item;
       const raw = btn.dataset.value;
-      const val = (raw === 'pass' || raw === 'fail') ? raw : parseInt(raw, 10);
+      const val = /^\d+$/.test(raw) ? parseInt(raw, 10) : raw;
       if (!formCache[docId]) return;
       captureVisibleNotes(docId, kind);
       formCache[docId].values[itemId] = val;
@@ -1477,6 +1557,17 @@ async function saveActiveForm(){
     logLine(`<span class="tag warn">save</span> nothing scored yet this session`);
     return;
   }
+  if (!sessionDecision || !sessionDecision.decision){
+    logLine(`<span class="tag warn">save</span> choose Pass or Fail for the session first (top of the page), then Save`);
+    const row = document.getElementById('sessionDecisionRow');
+    if (row){
+      row.classList.remove('needs-decision'); void row.offsetWidth; row.classList.add('needs-decision');
+      row.scrollIntoView({behavior: 'smooth', block: 'center'});
+    }
+    const el = saveStatusLabelEl();
+    if (el) el.textContent = 'Not saved — choose Pass or Fail for the session first';
+    return;
+  }
   setSaveStatus('saving');
   let count = 0;
   for (const form of entries){
@@ -1495,6 +1586,18 @@ async function saveActiveForm(){
     form.savedAt = payload.savedAt;
     count++;
   }
+  // The session decision row the production tracker reads.
+  const summary = await computeSessionSummary();
+  const decisionPayload = {
+    sessionId: ingested.sessionId, kind: 'session',
+    decision: sessionDecision.decision, overall: sessionDecision.decision,
+    recommended: summary ? summary.sessionPass : null, recommendedReason: summary ? summary.reason : null,
+    roomsKept: summary ? summary.kept : [], roomsRejected: summary ? summary.rejected : [],
+    decidedBy: currentUserEmail || null, scoreVersion: SCORE_VERSION,
+    savedAt: new Date().toISOString(),
+  };
+  await saveDoc(sessionDocId(), decisionPayload);
+  sessionDecision = {decision: decisionPayload.decision, savedAt: decisionPayload.savedAt, decidedBy: decisionPayload.decidedBy, dirty: false};
   setSaveStatus('saved', new Date().toISOString());
   // A reset has now been written over the old rows; from here on the saved
   // copies are the reset values, so stop ignoring them.
@@ -1512,7 +1615,7 @@ async function renderSavedList(){
   if (!docs.length){ el.innerHTML = `<div class="empty-state" style="padding:14px 4px;">${ingested.sessionId ? 'Nothing saved yet for this session.' : 'Nothing saved yet.'}</div>`; return; }
   docs.sort((a,b) => (b.savedAt||'').localeCompare(a.savedAt||''));
   el.innerHTML = docs.map(d => {
-    const label = d.kind === 'c0' ? 'C0' : d.kind === 'technical' ? `${d.scenarioId} · Technical` : `${d.scenarioId} · Episode${d.episodeNumber != null ? ' ' + d.episodeNumber : ''}`;
+    const label = d.kind === 'session' ? 'Session decision' : d.kind === 'c0' ? 'C0' : d.kind === 'technical' ? `${d.scenarioId} · Technical` : `${d.scenarioId} · Episode${d.episodeNumber != null ? ' ' + d.episodeNumber : ''}`;
     return `<div class="saved-row">
       <div class="meta"><b>${escapeHtml(label)}</b><span>${d.roomLabel ? escapeHtml(d.roomLabel)+' · ' : ''}${new Date(d.savedAt).toLocaleTimeString()}</span></div>
       <span class="badge-result ${d.overall || ''}">${escapeHtml(d.overall || '—')}</span>
@@ -1538,6 +1641,7 @@ function resetIngested(){
   activeForm = null;
   radarByScenario = {};
   ignoreSavedScoresFor = null;
+  sessionDecision = null;
   const log = document.getElementById('loadLog');
   if (log) log.innerHTML = '';
 }
@@ -1560,6 +1664,12 @@ function indexRadar(rooms){
 
 async function seedAllForms(){
   if (!ingested.sessionId) return;
+  if (!sessionDecision && ignoreSavedScoresFor !== ingested.sessionId){
+    const saved = await loadDoc(sessionDocId());
+    if (saved && (saved.decision === 'pass' || saved.decision === 'fail')){
+      sessionDecision = {decision: saved.decision, savedAt: saved.savedAt || null, decidedBy: saved.decidedBy || null, dirty: false};
+    }
+  }
   if (ingested.scenarios['C0']){
     const docId = `${ingested.sessionId}__C0__form`;
     await ensureFormLoaded(docId, ITEMS_C0, 'c0', 'C0', null, computeScenarioAutos('C0', ITEMS_C0));
@@ -1823,7 +1933,7 @@ document.getElementById('resetToRadarBtn').addEventListener('click', async () =>
   if (!ingested.sessionId){ logLine(`<span class="tag warn">reset</span> no session loaded yet`); return; }
   const ok = confirm(
     `Reset every score for session ${ingested.sessionId} to the radar and automatic suggestions?\n\n` +
-    `Saved scores for this session are set aside and the forms are refilled from the loaded files. ` +
+    `Saved scores and the session Pass/Fail decision for this session are set aside, and the forms are refilled from the loaded files. ` +
     `Reviewer notes and video annotations are kept. Scores the files can't suggest (for example the C0 motion items) will be empty.\n\n` +
     `Nothing changes in SharePoint until you press Save. Press Save to replace the saved scores; reload the page to back out.`
   );
@@ -1834,6 +1944,7 @@ document.getElementById('resetToRadarBtn').addEventListener('click', async () =>
   Object.values(formCache).forEach(f => { if (f.notes) typedNotes[f.docId] = f.notes; });
   clearLocalCacheForSession(ingested.sessionId);
   ignoreSavedScoresFor = ingested.sessionId;
+  sessionDecision = null;
   formCache = {};
   await seedAllForms();
   Object.entries(typedNotes).forEach(([docId, notes]) => { if (formCache[docId]) formCache[docId].notes = notes; });
