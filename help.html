@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scoring Guide — Project Sesame QA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f3f4f6; --panel: #ffffff; --panel-2: #f8f9fb; --border: #d9dde2; --text: #1a2027; --muted: #5d6675;
+    --accent: #3d6fb4; --accent-soft: #e5edf8; --warn: #8a5a12; --warn-soft: #faf0dd;
+    --fail: #b1483c; --fail-soft: #fbe9e7; --pass: #237a44; --pass-soft: #e5f4ea;
+    --font-ui: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161b; --panel: #191f26; --panel-2: #1f262e; --border: #2b333c; --text: #e7ebee; --muted: #98a3b0;
+      --accent: #7ea6dd; --accent-soft: #1c2634; --warn: #e2ab55; --warn-soft: #332b1a;
+      --fail: #e07a6e; --fail-soft: #372220; --pass: #6fcc8c; --pass-soft: #1c2f21;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161b; --panel: #191f26; --panel-2: #1f262e; --border: #2b333c; --text: #e7ebee; --muted: #98a3b0;
+    --accent: #7ea6dd; --accent-soft: #1c2634; --warn: #e2ab55; --warn-soft: #332b1a;
+    --fail: #e07a6e; --fail-soft: #372220; --pass: #6fcc8c; --pass-soft: #1c2f21;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-ui); font-size: 15px; line-height: 1.6; }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 32px 16px 80px; }
+  header { margin-bottom: 24px; }
+  header p { color: var(--muted); margin: 6px 0 0; }
+  h1 { font-size: 26px; line-height: 1.25; margin: 0; font-weight: 600; }
+  h2 { font-size: 19px; margin: 40px 0 10px; font-weight: 600; scroll-margin-top: 16px; }
+  h3 { font-size: 15px; margin: 22px 0 6px; font-weight: 600; }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--font-mono); font-size: 13px; }
+  nav.toc { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+  nav.toc ol { margin: 4px 0; columns: 2; column-gap: 24px; }
+  @media (max-width: 560px) { nav.toc ol { columns: 1; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin: 12px 0; }
+  .callout { background: var(--accent-soft); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 14px; margin: 12px 0; }
+  .callout.warn { background: var(--warn-soft); border-left-color: var(--warn); }
+  .table-scroll { overflow-x: auto; margin: 10px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 500; background: var(--panel-2); }
+  tr:last-child td { border-bottom: none; }
+  td:first-child { font-weight: 500; white-space: nowrap; }
+  .pri { font-family: var(--font-mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid; white-space: nowrap; }
+  .pri.P0 { color: var(--fail); border-color: var(--fail); }
+  .pri.P1 { color: var(--warn); border-color: var(--warn); }
+  .pri.gate { color: var(--fail); border-color: var(--fail); background: var(--fail-soft); }
+  .example { font-family: var(--font-mono); font-size: 13px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 6px 0; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 640px) { .two { grid-template-columns: 1fr; } }
+  .two .card { margin: 0; }
+  .two h3 { margin-top: 0; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Scoring Guide</h1>
+    <p>How the Project Sesame QA app works: what each score means, where the pre-filled values come from, how to justify a score, and when to flag a moment.</p>
+  </header>
+
+  <nav class="toc" aria-label="Contents">
+    <ol>
+      <li><a href="#workflow">Reviewing a session</a></li>
+      <li><a href="#scoring">How scoring works</a></li>
+      <li><a href="#c0">C0 calibration items</a></li>
+      <li><a href="#technical">Technical items (per room)</a></li>
+      <li><a href="#participant">Participant items (per episode)</a></li>
+      <li><a href="#justify">Justifying a score</a></li>
+      <li><a href="#flags">Flags and comments</a></li>
+      <li><a href="#decision">Rooms and the session decision</a></li>
+      <li><a href="#tools">Reset, clear and troubleshooting</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="workflow">1. Reviewing a session</h2>
+  <ol>
+    <li><b>Load the session.</b> Drop the day's inspection report under <i>Begin review</i> and pick the session, or drop the session's files by hand under <i>Or load files directly</i>. Files can be dropped in several batches; each drop adds to what is loaded.</li>
+    <li><b>Check the pre-filled scores.</b> Radar and file-based scores fill in automatically. They are suggestions marked <i>auto-suggested</i>.</li>
+    <li><b>Watch the video</b> for each scenario and episode, and change any score the footage contradicts.</li>
+    <li><b>Answer the manual items:</b> PII, moderator visible, audio/video quality if needed.</li>
+    <li><b>Flag or comment</b> on anything unusual at its timestamp.</li>
+    <li><b>Make the session decision</b> (Pass or Fail) in the banner at the top.</li>
+    <li><b>Save.</b> Save writes every form you touched plus the session decision. It will not save until a decision is chosen.</li>
+  </ol>
+
+  <h2 id="scoring">2. How scoring works</h2>
+  <p>Every item has a priority. Each item is turned into a percentage, then averaged with the other items of the same priority.</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Priority</th><th>Pass line</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><span class="pri gate">Gate</span></td><td>—</td><td>Pass/fail on its own. A failed gate fails the form outright, whatever the averages say. <b>Sync Chirp</b> (C0) and <b>PII visible</b> (episode) are gates.</td></tr>
+      <tr><td><span class="pri P0">P0</span></td><td>average ≥ 85%</td><td>Must-have items. A meter item's pass line is drawn on the meter (Continuous Movement passes at 75%); a value on its line counts as exactly passing.</td></tr>
+      <tr><td><span class="pri P1">P1</span></td><td>average ≥ 75%</td><td>Important items.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A form passes when no gate failed, its P0 average is ≥ 85% and its P1 average is ≥ 75%. Empty items are left out of the averages.</p>
+  <h3>How each kind of answer becomes a percentage</h3>
+  <ul>
+    <li><b>1 / 2 / 3 scale</b> — 1 = 33%, 2 = 67%, 3 = 100%. <b>3 is reserved for great.</b> One 2 on a P0 item usually pulls the P0 average below 85%.</li>
+    <li><b>0–100 meter</b> — the value itself, with the pass line drawn on the meter. A small triangle shows where the radar put it.</li>
+    <li><b>Yes / No</b> — Yes = 100%, No = 0%.</li>
+    <li><b>Counts</b> (Device Placements) — 6 positions sits exactly on the 85% line; more is higher, fewer is lower.</li>
+  </ul>
+
+  <h2 id="c0">3. C0 calibration items</h2>
+  <p>C0 is one ~55 s episode of smooth whole-rig motion recorded once per session. <b>C0 must pass for the session to pass.</b> The runbook asks for varied smooth motion, not an exact path: a different loop count, gentle tilt or imperfect plane is not by itself a failure.</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Item</th><th>Pre-filled from</th><th>How to judge</th></tr></thead>
+    <tbody>
+      <tr><td>Sync Chirp <span class="pri gate">Gate</span></td><td><code>session_evidence.json</code>: pass only if camera detection, ambiMIK detection and alignment all pass.</td><td>Fail fails C0 and therefore the session. Only override if the evidence file is clearly wrong, and say why in the notes.</td></tr>
+      <tr><td>Static (start) <span class="pri P0">P0</span></td><td>Radar: how much the rig moved in the first 5 s of the episode. 3 if ≤ 10%, 2 if ≤ 40%.</td><td>Was the rig held still before motion began?</td></tr>
+      <tr><td>Figure-8 motion <span class="pri P0">P0</span></td><td>Radar: how much of the middle of the episode the rig was moving. 3 if ≥ 50%, 2 if ≥ 25%.</td><td>The radar only sees <i>that</i> the rig moved, not the shape. Confirm smooth looping motion on the video.</td></tr>
+      <tr><td>Translation <span class="pri P0">P0</span></td><td>Same radar reading as Figure-8.</td><td>Confirm forward/back, left/right and up/down movement on the video.</td></tr>
+      <tr><td>Static (end) <span class="pri P0">P0</span></td><td>Radar: rig motion in the last 5 s. Same cut points as Static (start).</td><td>Was the rig set down and still before End Episode?</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">Rig-motion suggestions need the C0 <code>.mmwave.bin</code> together with its <code>capture.json</code>, episode markers and mmwave sync JSON.</p>
+
+  <h2 id="technical">4. Technical items (per room)</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Item</th><th>Pre-filled from</th><th>How to judge</th></tr></thead>
+    <tbody>
+      <tr><td>Device Placements <span class="pri P0">P0</span></td><td>Radar estimate of distinct rig positions (background shifts between episodes, plus 1).</td><td>The estimate tends to <b>over</b>count, because it cannot tell a revisit from a new spot. Count the distinct views on the video when the number is close to 6.</td></tr>
+      <tr><td>Audio Quality <span class="pri P1">P1</span></td><td><code>session_validation.json</code>: 3 if no audio issues, 2 for warnings, 1 for errors.</td><td>Listen for clipping, dropouts, heavy noise.</td></tr>
+      <tr><td>Video Quality <span class="pri P1">P1</span></td><td><code>session_validation.json</code>, same rule for video issues.</td><td>Look for exposure, focus, framing and dropped frames.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="participant">5. Participant items (per episode)</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Item</th><th>Pre-filled from</th><th>How to judge</th></tr></thead>
+    <tbody>
+      <tr><td>PII visible <span class="pri gate">Gate</span></td><td>Starts at <b>No</b>.</td><td>Flip to <b>Yes</b> if anything identifies someone who has not consented, or private information is readable: an unconsented face, a screen, documents, a name badge, a licence plate. Yes fails the episode. Always flag the moment too.</td></tr>
+      <tr><td>Continuous Movement <span class="pri P0">P0</span></td><td>Radar: % of tracked frames where the tracked person moved faster than 0.3 m/s. Pass line 75%.</td><td>The radar follows one target. Stillness (sitting, standing) mostly drops out of tracking rather than counting as "not moving". With several people it may switch between them. Check the video when the number looks wrong.</td></tr>
+      <tr><td>Blue Zone % <span class="pri P1">P1</span></td><td>Radar: % of tracked frames inside the 120° forward view, within 5 m. Pass line 75%.</td><td>Most of the episode should be in front of the rig.</td></tr>
+      <tr><td>Outside view beyond 3 m % <span class="pri P1">P1</span></td><td>Radar: % of tracked frames outside the forward view <i>and</i> past 3 m. Pass ≤ 10%.</td><td>The runbook asks for brief exits within 2 m and a turn back before 3 m. Brief exits are fine (their share is in the note); lingering past 3 m is the fault.</td></tr>
+      <tr><td>Speed Variance <span class="pri P1">P1</span></td><td>Radar speed spread: 2 from 0.25 m/s, 3 from 0.5 m/s.</td><td>Natural changes of pace. Constant speed looks staged. 3 only if clearly natural.</td></tr>
+      <tr><td>Distance Variance <span class="pri P1">P1</span></td><td>Radar distance spread: 2 from 0.5 m, 3 from 1.0 m.</td><td>Natural moves between near and far. 3 only if clearly natural.</td></tr>
+      <tr><td>Moderator visible and moving <span class="pri P1">P1</span></td><td>Blank — you answer it.</td><td><b>Yes</b> when the moderator stays visible to the camera and keeps moving naturally. <b>No</b> if they are hidden or stand static for long stretches.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="justify">6. Justifying a score</h2>
+  <p>The pre-filled numbers are measurements, not verdicts. Keep them unless the video shows they are wrong. When you change one, or make a borderline call, write a note in the episode's <i>Reviewer notes</i> so the next person can follow your reasoning.</p>
+  <div class="card">
+    <b>A good note says three things:</b>
+    <ol>
+      <li><b>What you saw</b>, with a timestamp.</li>
+      <li><b>What you changed</b>, from what to what.</li>
+      <li><b>Why</b> — the rule it relates to.</li>
+    </ol>
+    <div class="example">0:12–0:40 participant sits on the sofa; radar lost them. Continuous Movement 41% → 70%: they were moving the rest of the time.</div>
+    <div class="example">Speed Variance 3 → 2: same walking pace for most of the episode, only one change at 0:35.</div>
+    <div class="example">PII Yes: unconsented passer-by's face at 0:22, clearly visible for 3 s. Flagged.</div>
+  </div>
+  <ul>
+    <li><b>Change a score</b> when the video clearly contradicts it: the radar followed the wrong person, lost someone for a long stretch, or the footage shows something the files cannot (PII, the moderator, picture quality).</li>
+    <li><b>Do not change a score</b> just to get an episode over the line. If it is close, leave it and say so in the note.</li>
+    <li>A changed radar value shows <i>adjusted · radar N</i>, so the original stays visible.</li>
+    <li>If the radar note says it tracked only a small share of frames, treat its numbers as weak and lean on the video.</li>
+  </ul>
+
+  <h2 id="flags">7. Flags and comments</h2>
+  <p>Both are pinned to a moment in the video. Use the button while the video is at that moment.</p>
+  <div class="two">
+    <div class="card">
+      <h3>⚑ Flag a moment when</h3>
+      <ul>
+        <li>PII is visible</li>
+        <li>an unconsented person appears</li>
+        <li>the rig moves or is touched during an episode</li>
+        <li>someone lingers outside the view past 3 m</li>
+        <li>video or audio drops, freezes or is unusable</li>
+        <li>anything unsafe happens</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>💬 Comment when</h3>
+      <ul>
+        <li>a later reviewer needs context ("operator walks through at 0:32")</li>
+        <li>it explains a score you changed</li>
+        <li>you made a borderline call</li>
+      </ul>
+    </div>
+  </div>
+  <p>Keep each one to a sentence. Flags and comments save immediately; they do not need the Save button.</p>
+
+  <h2 id="decision">8. Rooms and the session decision</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Level</th><th>Rule</th></tr></thead>
+    <tbody>
+      <tr><td>Episode</td><td>Passes when no gate failed (PII = No), P0 ≥ 85% and P1 ≥ 75%.</td></tr>
+      <tr><td>Room (T1)</td><td><b>Kept</b> when its technical items pass and it has at least <b>10 passing episodes</b>. Otherwise <b>rejected</b>. Episodes the operator excluded in Hydra never count.</td></tr>
+      <tr><td>Session</td><td>Passes when <b>C0 passes</b> and <b>at least one T1 room is kept</b>. Rejected rooms are dropped. If the session has only one T1 room, that room being rejected fails the session.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The banner at the top shows the app's <b>Recommended</b> result and why. A ✕ on a room pill means that room is rejected. <b>Your decision</b> (Pass or Fail) is what counts: it is saved as the session's result and goes to the production tracker, where the team decides whether to deliver the session. Choose it after reviewing; Save will not run without it.</p>
+  <div class="callout warn">If you decide against the recommendation, say why in a comment or a reviewer note.</div>
+
+  <h2 id="tools">9. Reset, clear and troubleshooting</h2>
+  <ul>
+    <li><b>Reset scores to radar</b> sets aside every saved score and the session decision for the loaded session, and refills the forms from the radar and the files. Notes and flags are kept. Nothing changes in SharePoint until you Save; reload the page to back out.</li>
+    <li><b>Clear local cache</b> removes this browser's backup copy of the session only. Use it after rows were deleted in SharePoint directly.</li>
+    <li><b>A value looks impossible</b> (for example 3% movement on someone clearly walking): it is probably an old saved value from before a scoring change. Use <i>Reset scores to radar</i>.</li>
+    <li><b>"Downloads were blocked … CORS"</b>: the blob storage is not yet set up for this site. Drop the files by hand instead.</li>
+    <li><b>No radar scores for a room</b>: the room needs its <code>.mmwave.bin</code>, episode markers and mmwave sync JSON. The load log says which file is missing.</li>
+  </ul>
+</div>
+</body>
+</html>
