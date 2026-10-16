@@ -2,11 +2,11 @@
  * Office Script — run via Power Automate's "Run script" action, against a
  * fresh COPY of QA_Scorecard_Template.xlsx (not the template itself).
  *
- * Ports the exact same scoring math as the QA app's app.js (toPct,
- * computeScores, blendedRoomQuality, computeRoomGate, computeSessionSummary)
- * so the numbers here always match what the app itself would show — this
- * file is the one place that logic needs to stay in sync if the rubric
- * ever changes.
+ * Ports the same scoring rules as the QA app's app.js (toPct,
+ * computeScores, scoresOf, blendedRoomQuality, computeRoomGate,
+ * computeSessionSummary) so the numbers here match what the app shows —
+ * this file is the one place that logic needs to stay in sync if the
+ * rubric ever changes.
  *
  * Parameters (Power Automate maps these to dynamic content automatically
  * once this script is selected in the "Run script" action):
@@ -18,6 +18,10 @@
  *   roomsLabel          - display string, e.g. "Home Office, Kitchen, Living Room"
  *   primaryModName / primaryModEmail / qaModName / qaModEmail - from
  *                         tbl_qa_session_feedback
+ *
+ * Template cells written: B5:B11 (details), B14 (reviewer's session
+ * decision), F14 (app recommendation + reason), F15 (rooms kept/rejected),
+ * B15 / D15 (session P0 / P1 averages), plus the three tables.
  */
 function main(
   workbook: ExcelScript.Workbook,
@@ -31,19 +35,24 @@ function main(
   qaModEmail: string
 ) {
   // ---- Item definitions (must match ITEMS_C0 / ITEMS_TECHNICAL / ITEMS_PARTICIPANT in app.js) ----
-  type Kind = "gate" | "scale" | "percent";
+  // gate:    pass/fail; "fail" fails the form outright, never averaged
+  // flag:    yes/no;    the failOn value fails the form outright, never averaged (PII)
+  // yesno:   yes = 100%, no = 0%
+  // scale:   1/2/3 -> 33/67/100%
+  // percent: a measurement, see toPct
+  type Kind = "gate" | "flag" | "yesno" | "scale" | "percent";
   type Direction = "higher_is_better" | "lower_is_better";
   interface ItemDef {
     id: string; priority: "P0" | "P1"; kind: Kind; label: string;
-    direction?: Direction; referenceValue?: number;
+    direction?: Direction; referenceValue?: number; failOn?: string;
   }
 
   const ITEMS_C0: ItemDef[] = [
     { id: "sync_chirp", priority: "P0", kind: "gate", label: "Sync Chirp" },
-    { id: "static_5s", priority: "P0", kind: "scale", label: "5-Second Static (start)" },
+    { id: "static_5s", priority: "P0", kind: "scale", label: "Static (start)" },
     { id: "figure_8", priority: "P0", kind: "scale", label: "Figure-8 Motion" },
     { id: "translation", priority: "P0", kind: "scale", label: "Translation Movements" },
-    { id: "static_end", priority: "P0", kind: "scale", label: "Static Before End" },
+    { id: "static_end", priority: "P0", kind: "scale", label: "Static (end)" },
   ];
   const ITEMS_TECHNICAL: ItemDef[] = [
     { id: "device_placements", priority: "P0", kind: "percent", label: "Device Placements", direction: "higher_is_better", referenceValue: 6 },
@@ -51,28 +60,34 @@ function main(
     { id: "video_quality", priority: "P1", kind: "scale", label: "Video Quality" },
   ];
   const ITEMS_PARTICIPANT: ItemDef[] = [
-    { id: "continuous_movement", priority: "P0", kind: "percent", label: "Continuous Movement", direction: "higher_is_better" },
+    { id: "pii", priority: "P0", kind: "flag", failOn: "yes", label: "PII visible" },
+    { id: "continuous_movement", priority: "P0", kind: "percent", label: "Continuous Movement", direction: "higher_is_better", referenceValue: 75 },
     { id: "blue_zone_pct", priority: "P1", kind: "percent", label: "Blue Zone %", direction: "higher_is_better" },
-    { id: "orange_zone", priority: "P1", kind: "percent", label: "Orange Zone %", direction: "lower_is_better" },
-    { id: "speed_variance", priority: "P1", kind: "percent", label: "Speed Variance", direction: "higher_is_better", referenceValue: 5.0 },
-    { id: "distance_variance", priority: "P1", kind: "percent", label: "Distance Variance", direction: "higher_is_better", referenceValue: 1.0 },
+    { id: "outside_far", priority: "P1", kind: "percent", label: "Outside view beyond 3 m %", direction: "lower_is_better", referenceValue: 10 },
+    { id: "speed_variance", priority: "P1", kind: "scale", label: "Speed Variance" },
+    { id: "distance_variance", priority: "P1", kind: "scale", label: "Distance Variance" },
+    { id: "moderator_visible", priority: "P1", kind: "yesno", label: "Moderator visible and moving" },
   ];
   const MIN_GOOD_EPISODES = 10;
 
-  // Lookup by id -- several places below need an item's full definition
-  // (direction/referenceValue/priority) when all they originally had was
-  // its id string, now that toPct needs more than just a bare kind.
-  const ALL_ITEMS: ItemDef[] = [...ITEMS_C0, ...ITEMS_TECHNICAL, ...ITEMS_PARTICIPANT];
-  const ITEM_BY_ID: { [id: string]: ItemDef } = {};
-  ALL_ITEMS.forEach(it => { ITEM_BY_ID[it.id] = it; });
+  // Rows saved before the 1/2/3 change (no scoreVersion 2) hold the raw
+  // speed / distance spread; bucket them the same way app.js does.
+  const SCORE_VERSION = 2;
+  const VARIANCE_BUCKETS: { [id: string]: { some: number; great: number } } = {
+    speed_variance: { some: 0.25, great: 0.5 },
+    distance_variance: { some: 0.5, great: 1.0 },
+  };
 
-  // Must match app.js's toPct exactly -- see that file's comment for the
-  // full reasoning on each branch (naturally-bounded complement for
-  // no-referenceValue lower_is_better items like Orange Zone vs. scaled
-  // against this item's own pass threshold for raw-unit items like Speed
-  // Variance).
-  function toPct(it: ItemDef, v: number | null): number | null {
-    if (v == null) return null;
+  type ScoreValue = string | number | null;
+  type Scores = { [k: string]: ScoreValue };
+
+  // Must match app.js's toPct exactly.
+  function toPct(it: ItemDef, raw: ScoreValue | undefined): number | null {
+    if (raw == null || raw === "") return null;
+    if (it.kind === "yesno") return raw === "yes" ? 100 : raw === "no" ? 0 : null;
+    if (it.kind === "flag" || it.kind === "gate") return null; // pass/fail only, never averaged
+    const v = Number(raw);
+    if (isNaN(v)) return null;
     if (it.kind !== "percent") return (v / 3) * 100;
     const dir: Direction = it.direction || "higher_is_better";
     if (it.referenceValue == null) return dir === "lower_is_better" ? (100 - v) : v;
@@ -85,17 +100,18 @@ function main(
   function avg(arr: number[]): number | null {
     return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
   }
+  function round(v: number | null): string | number { return v == null ? "" : Math.round(v); }
 
-  type ScoreValue = string | number;
   interface ScoreResult { p0Pct: number | null; p1Pct: number | null; gateFailed: boolean; overall: string; }
-  function computeScores(items: ItemDef[], values: { [k: string]: ScoreValue }): ScoreResult {
+  function computeScores(items: ItemDef[], values: Scores): ScoreResult {
     let gateFailed = false;
     const p0: number[] = [], p1: number[] = [];
     for (const it of items) {
       const v = values[it.id];
       if (it.kind === "gate") { if (v === "fail") gateFailed = true; }
+      else if (it.kind === "flag") { if (v === it.failOn) gateFailed = true; }
       else {
-        const pct = toPct(it, v == null ? null : Number(v));
+        const pct = toPct(it, v);
         if (pct != null) (it.priority === "P0" ? p0 : p1).push(pct);
       }
     }
@@ -112,7 +128,12 @@ function main(
 
   // ---- Parse the raw rows for this session ----
   interface RawRow { doc_id: string; session_id: string; scenario_id: string; episode_id: string; kind: string; payload_json: string; saved_at: string; }
-  interface Payload { scores?: { [k: string]: ScoreValue }; notes?: string; overall?: string; roomLabel?: string; episodeNumber?: number | null; annotations?: { type: string; timeSec: number; text: string }[]; }
+  interface Payload {
+    scores?: Scores; scoreVersion?: number; notes?: string; overall?: string; roomLabel?: string;
+    episodeNumber?: number | null; disposition?: string | null;
+    annotations?: { type: string; timeSec: number; text: string }[];
+    decision?: string; decidedBy?: string | null;
+  }
 
   const rawRows: RawRow[] = JSON.parse(scoreRowsJson);
   const sessionRows = rawRows.filter(r => r.session_id === sessionId);
@@ -120,89 +141,99 @@ function main(
   function parsePayload(r: RawRow): Payload {
     try { return JSON.parse(r.payload_json); } catch (e) { return {}; }
   }
+  // Same as app.js scoresOf(): bucket pre-version-2 raw variance values.
+  function scoresOf(p: Payload): Scores {
+    const scores: Scores = { ...(p.scores || {}) };
+    if (!(p.scoreVersion != null && p.scoreVersion >= SCORE_VERSION)) {
+      Object.keys(VARIANCE_BUCKETS).forEach(id => {
+        const raw = scores[id];
+        if (raw == null || raw === "") return;
+        const v = Number(raw), b = VARIANCE_BUCKETS[id];
+        scores[id] = v >= b.great ? 3 : (v >= b.some ? 2 : 1);
+      });
+    }
+    return scores;
+  }
 
   const c0Row = sessionRows.find(r => r.kind === "c0");
-  // However many T1 rooms this session actually has — not assumed to be 3.
-  // Derived from whatever scenario_ids show up in the real data, sorted by
-  // room number (T1-R1, T1-R2, T1-R3, T1-R4, ...).
+  const sessionRow = sessionRows.find(r => r.kind === "session");
+  // However many T1 rooms this session actually has, sorted by room number.
   const roomIds = Array.from(new Set(
     sessionRows.map(r => r.scenario_id).filter(id => /^T1-R\d+$/.test(id))
   )).sort((a, b) => parseInt(a.slice(4), 10) - parseInt(b.slice(4), 10));
 
   function techRowFor(scenarioId: string) { return sessionRows.find(r => r.kind === "technical" && r.scenario_id === scenarioId); }
-  function participantRowsFor(scenarioId: string) { return sessionRows.filter(r => r.kind === "participant" && r.scenario_id === scenarioId); }
+  // Episodes the operator excluded in Hydra never count (the app saves the
+  // disposition; rows saved before that have none and are counted).
+  function participantRowsFor(scenarioId: string) {
+    return sessionRows.filter(r => r.kind === "participant" && r.scenario_id === scenarioId
+      && parsePayload(r).disposition !== "excluded");
+  }
   function annotationsFor(scenarioId: string) {
     const row = sessionRows.find(r => r.kind === "annotations" && r.scenario_id === scenarioId);
     return row ? (parsePayload(row).annotations || []) : [];
   }
 
-  // ---- C0 ----
-  const c0Values = c0Row ? (parsePayload(c0Row).scores || {}) : {};
+  // ---- C0 (must pass for the session to pass) ----
+  const c0Values = c0Row ? scoresOf(parsePayload(c0Row)) : {};
   const c0Scores = computeScores(ITEMS_C0, c0Values);
   const c0GatePass: boolean | null = c0Row ? (!c0Scores.gateFailed && (c0Scores.p0Pct == null ? null : c0Scores.p0Pct >= 85)) : null;
 
   // ---- Per T1 room ----
+  interface EpisodeResult { episodeId: string; episodeNumber: number | null; result: string; p0Pct: number | null; p1Pct: number | null; belowItems: string[]; notes: string; }
   interface RoomResult {
     scenarioId: string; roomLabel: string; techScores: ScoreResult;
-    retainedCount: number; passedCount: number; meetsMinimum: boolean;
+    countedEpisodes: number; passedCount: number; meetsMinimum: boolean; technicalOk: boolean;
     gatePass: boolean | null; blendedP0: number | null; blendedP1: number | null;
-    episodes: { episodeId: string; episodeNumber: number | null; result: string; p0Pct: number | null; p1Pct: number | null; belowItems: string[]; notes: string }[];
+    episodes: EpisodeResult[];
+  }
+
+  function belowThreshold(items: ItemDef[], values: Scores): string[] {
+    const out: string[] = [];
+    for (const it of items) {
+      const v = values[it.id];
+      if (v == null || v === "") continue;
+      if (it.kind === "flag") { if (v === it.failOn) out.push(it.label); continue; }
+      if (it.kind === "gate") { if (v === "fail") out.push(it.label); continue; }
+      const pct = toPct(it, v);
+      const threshold = it.priority === "P0" ? 85 : 75;
+      if (pct != null && pct < threshold) out.push(it.label);
+    }
+    return out;
   }
 
   function computeRoom(scenarioId: string): RoomResult {
     const techRow = techRowFor(scenarioId);
-    const techValues = techRow ? (parsePayload(techRow).scores || {}) : {};
+    const techValues = techRow ? scoresOf(parsePayload(techRow)) : {};
     const techScores = computeScores(ITEMS_TECHNICAL, techValues);
     const partRows = participantRowsFor(scenarioId);
+    const partScores = partRows.map(r => scoresOf(parsePayload(r)));
 
-    const p0vals: number[] = [];
-    const p1vals: number[] = [];
-    const dp = techValues["device_placements"] != null ? toPct(ITEM_BY_ID["device_placements"], Number(techValues["device_placements"])) : null;
-    if (dp != null) p0vals.push(dp);
-    const aq = techValues["audio_quality"] != null ? toPct(ITEM_BY_ID["audio_quality"], Number(techValues["audio_quality"])) : null;
-    if (aq != null) p1vals.push(aq);
-    const vq = techValues["video_quality"] != null ? toPct(ITEM_BY_ID["video_quality"], Number(techValues["video_quality"])) : null;
-    if (vq != null) p1vals.push(vq);
-
-    const episodes = partRows.map(r => {
+    const episodes: EpisodeResult[] = partRows.map((r, i) => {
       const payload = parsePayload(r);
-      const values = payload.scores || {};
+      const values = partScores[i];
       const scores = computeScores(ITEMS_PARTICIPANT, values);
-      const belowItems: string[] = [];
-      for (const it of ITEMS_PARTICIPANT) {
-        const v = values[it.id];
-        if (v == null) continue;
-        const pct = toPct(it, Number(v));
-        const threshold = it.priority === "P0" ? 85 : 75;
-        if (pct != null && pct < threshold) belowItems.push(it.label);
-      }
       return {
         episodeId: r.episode_id,
-        // Present for anything saved after the app.js fix; older rows saved
-        // before that fix won't have it, so this still falls back to null
-        // (and the sheet falls back to showing episode_id) rather than
-        // breaking on older data.
+        // Rows saved before episodeNumber was added fall back to episode_id.
         episodeNumber: payload.episodeNumber != null ? payload.episodeNumber : null,
         result: scores.overall === "pass" ? "PASS" : (scores.overall === "fail" ? "FAIL" : "INCOMPLETE"),
         p0Pct: scores.p0Pct, p1Pct: scores.p1Pct,
-        belowItems, notes: payload.notes || "",
+        belowItems: belowThreshold(ITEMS_PARTICIPANT, values), notes: payload.notes || "",
       };
-    });
+    }).sort((a, b) => (a.episodeNumber || 0) - (b.episodeNumber || 0));
 
-    // Continuous Movement specifically (P0 participant item) contributes to the room's P0 pool:
-    const cmPctVals = partRows.map(r => {
-      const v = (parsePayload(r).scores || {})["continuous_movement"];
-      return v == null ? null : toPct(ITEM_BY_ID["continuous_movement"], Number(v));
-    }).filter((v): v is number => v != null);
-    if (cmPctVals.length) p0vals.push(avg(cmPctVals) as number);
-
-    (["blue_zone_pct", "orange_zone", "speed_variance", "distance_variance"] as const).forEach(id => {
-      const vals = partRows.map(r => {
-        const v = (parsePayload(r).scores || {})[id];
-        return v == null ? null : toPct(ITEM_BY_ID[id], Number(v));
-      }).filter((v): v is number => v != null);
-      if (vals.length) p1vals.push(avg(vals) as number);
-    });
+    // Blended room quality (same as app.js blendedRoomQuality): each
+    // technical item, plus each participant item averaged across episodes.
+    const p0vals: number[] = [], p1vals: number[] = [];
+    for (const it of ITEMS_TECHNICAL) {
+      const pct = toPct(it, techValues[it.id]);
+      if (pct != null) (it.priority === "P0" ? p0vals : p1vals).push(pct);
+    }
+    for (const it of ITEMS_PARTICIPANT) {
+      const pcts = partScores.map(s => toPct(it, s[it.id])).filter((v): v is number => v != null);
+      if (pcts.length) (it.priority === "P0" ? p0vals : p1vals).push(avg(pcts) as number);
+    }
 
     const passedCount = episodes.filter(e => e.result === "PASS").length;
     const meetsMinimum = passedCount >= MIN_GOOD_EPISODES;
@@ -213,7 +244,7 @@ function main(
 
     return {
       scenarioId, roomLabel: techRow ? (parsePayload(techRow).roomLabel || scenarioId) : scenarioId,
-      techScores, retainedCount: partRows.length, passedCount, meetsMinimum,
+      techScores, countedEpisodes: partRows.length, passedCount, meetsMinimum, technicalOk,
       gatePass: hasAnyData ? (technicalOk && meetsMinimum) : null,
       blendedP0: avg(p0vals), blendedP1: avg(p1vals),
       episodes,
@@ -223,22 +254,38 @@ function main(
   const rooms: { [k: string]: RoomResult } = {};
   for (const id of roomIds) rooms[id] = computeRoom(id);
 
-  // ---- Session rollup — same strict-AND logic as before, just over
-  // however many rooms this session actually has instead of a fixed 3 ----
-  const gates = [c0GatePass, ...roomIds.map(id => rooms[id].gatePass)];
-  let sessionResult = "INCOMPLETE";
-  if (gates.some(g => g === false)) sessionResult = "FAIL";
-  else if (gates.every(g => g === true)) sessionResult = "PASS";
+  // ---- Session recommendation (same as app.js computeSessionSummary) ----
+  // C0 must pass. Each room is kept if it qualifies, else rejected; the
+  // session passes when C0 passes and at least one room is kept.
+  const kept = roomIds.filter(id => rooms[id].gatePass === true);
+  const rejected = roomIds.filter(id => rooms[id].gatePass === false);
+  const pending = roomIds.filter(id => rooms[id].gatePass == null);
+  let recommended = "INCOMPLETE";
+  let reason = "";
+  if (c0GatePass === false) { recommended = "FAIL"; reason = "C0 failed"; }
+  else if (roomIds.length && rejected.length === roomIds.length) {
+    recommended = "FAIL";
+    reason = roomIds.length === 1 ? `${roomIds[0]} rejected (needs ${MIN_GOOD_EPISODES} passing episodes)` : `every T1 room rejected (each needs ${MIN_GOOD_EPISODES} passing episodes)`;
+  }
+  else if (c0GatePass === true && kept.length) {
+    recommended = "PASS";
+    reason = `C0 passed · kept ${kept.join(", ")}` + (rejected.length ? ` · rejected ${rejected.join(", ")}` : "") + (pending.length ? ` · not scored yet ${pending.join(", ")}` : "");
+  }
+  else {
+    const waiting = (c0GatePass == null ? ["C0"] : []).concat(pending);
+    reason = waiting.length ? `waiting on ${waiting.join(", ")}` : "no T1 room scored";
+  }
   const sessionP0 = avg([c0Scores.p0Pct, ...roomIds.map(id => rooms[id].blendedP0)].filter((v): v is number => v != null));
   const sessionP1 = avg(roomIds.map(id => rooms[id].blendedP1).filter((v): v is number => v != null));
 
+  // The reviewer's decision (saved by the app as a 'session' row) is the
+  // session's result. Older sessions without one show the recommendation.
+  const sessionPayload = sessionRow ? parsePayload(sessionRow) : null;
+  const decision = sessionPayload && (sessionPayload.decision === "pass" || sessionPayload.decision === "fail")
+    ? sessionPayload.decision.toUpperCase() : null;
+
   // =====================================================================
-  // Write to the "Scorecard" sheet.
-  // Session Details + Final Result stay fixed-cell (always exactly one
-  // value each, regardless of room count). Scenario Breakdown is now a
-  // real Table (tbl_scenario_breakdown) instead of 4 fixed rows, since a
-  // session can have any number of T1 rooms — same direct-overwrite-
-  // first-row-then-addRow pattern as Episode Detail/Flagged Moments below.
+  // Scorecard sheet
   // =====================================================================
   const scorecard = workbook.getWorksheet("Scorecard");
   scorecard.getRange("B5").setValue(sessionId);
@@ -249,9 +296,14 @@ function main(
   scorecard.getRange("B10").setValue(qaModName);
   scorecard.getRange("B11").setValue(qaModEmail);
 
-  scorecard.getRange("B14").setValue(sessionResult);
-  scorecard.getRange("B15").setValue(sessionP0 == null ? "" : Math.round(sessionP0));
-  scorecard.getRange("D15").setValue(sessionP1 == null ? "" : Math.round(sessionP1));
+  scorecard.getRange("B14").setValue(decision != null ? decision : `NOT DECIDED (recommended ${recommended})`);
+  scorecard.getRange("F14").setValue(`${recommended}${reason ? " — " + reason : ""}`);
+  scorecard.getRange("F15").setValue(
+    roomIds.length
+      ? `Kept: ${kept.length ? kept.join(", ") : "none"} · Rejected: ${rejected.length ? rejected.join(", ") : "none"}${pending.length ? " · Not scored: " + pending.join(", ") : ""}`
+      : "No T1 rooms scored");
+  scorecard.getRange("B15").setValue(round(sessionP0));
+  scorecard.getRange("D15").setValue(round(sessionP1));
 
   const sbTable = scorecard.getTables()[0]; // tbl_scenario_breakdown
   const sbBodyRange = sbTable.getRangeBetweenHeaderAndTotal();
@@ -267,54 +319,46 @@ function main(
   }
 
   // C0 row
+  const c0Issues: string[] = [];
+  if (c0Scores.gateFailed) c0Issues.push("Sync chirp failed");
+  if (c0Scores.p0Pct != null && c0Scores.p0Pct < 85) c0Issues.push(`P0 below 85%: ${belowThreshold(ITEMS_C0, c0Values).filter(l => l !== "Sync Chirp").join(", ")}`);
+  if (c0GatePass === false) c0Issues.push("C0 must pass, so the session fails");
   writeScenarioRow([
     "C0",
     c0GatePass == null ? "INCOMPLETE" : (c0GatePass ? "PASS" : "FAIL"),
-    c0Scores.p0Pct == null ? "" : Math.round(c0Scores.p0Pct),
+    round(c0Scores.p0Pct),
     "N/A", "N/A",
-    c0Scores.gateFailed ? "Sync chirp failed" : "",
+    c0Issues.join("; "),
   ]);
 
-  // One row per room this session actually has — however many that is.
+  // One row per room: KEPT / REJECTED
   for (const scenarioId of roomIds) {
     const room = rooms[scenarioId];
     const issues: string[] = [];
     if (room.techScores.p0Pct != null && room.techScores.p0Pct < 85) issues.push("Technical P0 below threshold");
     if (room.techScores.p1Pct != null && room.techScores.p1Pct < 75) issues.push("Technical P1 below threshold");
-    if (!room.meetsMinimum) issues.push(`Only ${room.passedCount}/${MIN_GOOD_EPISODES} required good episodes`);
+    if (!room.meetsMinimum) issues.push(`Only ${room.passedCount}/${MIN_GOOD_EPISODES} required passing episodes`);
     const failedEps = room.episodes.filter(e => e.result === "FAIL");
-    if (failedEps.length) issues.push(`${failedEps.length} episode(s) failed: ${failedEps.map(e => e.episodeId).join(", ")}`);
+    if (failedEps.length) issues.push(`${failedEps.length} episode(s) failed: ${failedEps.map(e => e.episodeNumber != null ? `#${e.episodeNumber}` : e.episodeId).join(", ")}`);
+    const piiEps = room.episodes.filter(e => e.belowItems.indexOf("PII visible") >= 0);
+    if (piiEps.length) issues.push(`PII in episode(s) ${piiEps.map(e => e.episodeNumber != null ? `#${e.episodeNumber}` : e.episodeId).join(", ")}`);
 
     writeScenarioRow([
       scenarioId,
-      room.gatePass == null ? "INCOMPLETE" : (room.gatePass ? "PASS" : "FAIL"),
-      room.blendedP0 == null ? "" : Math.round(room.blendedP0),
-      room.blendedP1 == null ? "" : Math.round(room.blendedP1),
+      room.gatePass == null ? "INCOMPLETE" : (room.gatePass ? "KEPT" : "REJECTED"),
+      round(room.blendedP0),
+      round(room.blendedP1),
       room.passedCount,
       issues.join("; "),
     ]);
   }
 
   // =====================================================================
-  // Episode Detail — real Table, cleared and rebuilt to the exact
-  // number of real episodes (unlike the fixed Scenario Breakdown rows).
+  // Episode Detail — overwrite the sample row, then addRow for the rest
+  // (this pattern avoids a delete-after-add issue seen in Office Scripts).
   // =====================================================================
   const epSheet = workbook.getWorksheet("Episode Detail");
   const epTable = epSheet.getTables()[0]; // tbl_episode_detail
-  // Capture a direct reference to the original sample row's Range BEFORE
-  // adding anything, rather than adding everything first and deleting the
-  // sample row(s) afterward by position/count. The previous approach
-  // (add N rows, then deleteRowsAt(0, sampleCount)) intermittently dropped
-  // one real row in practice — likely an Office Scripts batching/timing
-  // quirk between many sequential addRow calls and an immediate
-  // deleteRowsAt right after, though the exact mechanism wasn't fully
-  // confirmed. This version sidesteps that whole class of risk: the first
-  // real episode overwrites the captured sample row's cells directly via
-  // plain Range.setValues (a basic, well-established API, unlike the
-  // Table-level row-count/delete methods that caused trouble before);
-  // every subsequent episode still uses addRow as normal. If there turn
-  // out to be zero real episodes, the sample row is simply left untouched,
-  // same as before.
   const epBodyRange = epTable.getRangeBetweenHeaderAndTotal();
   const epFirstRowRange = epBodyRange.getRowCount() > 0 ? epBodyRange.getRow(0) : null;
   let epFirstRowUsed = false;
@@ -324,8 +368,7 @@ function main(
     for (const ep of room.episodes) {
       const rowValues = [
         scenarioId, ep.episodeNumber != null ? ep.episodeNumber : ep.episodeId, ep.result,
-        ep.p0Pct == null ? "" : Math.round(ep.p0Pct),
-        ep.p1Pct == null ? "" : Math.round(ep.p1Pct),
+        round(ep.p0Pct), round(ep.p1Pct),
         ep.belowItems.join(", "), ep.notes,
       ];
       if (!epFirstRowUsed && epFirstRowRange) {
@@ -338,11 +381,10 @@ function main(
   }
 
   // =====================================================================
-  // Flagged Moments — same pattern, real Table.
+  // Flagged Moments — same pattern.
   // =====================================================================
   const fmSheet = workbook.getWorksheet("Flagged Moments");
   const fmTable = fmSheet.getTables()[0]; // tbl_flagged_moments
-  // Same direct-overwrite approach as Episode Detail above.
   const fmBodyRange = fmTable.getRangeBetweenHeaderAndTotal();
   const fmFirstRowRange = fmBodyRange.getRowCount() > 0 ? fmBodyRange.getRow(0) : null;
   let fmFirstRowUsed = false;
@@ -352,7 +394,7 @@ function main(
     const m = Math.floor(s / 60), r = s % 60;
     return `${m}:${r < 10 ? "0" : ""}${r}`;
   }
-  for (const scenarioId of roomIds) {
+  for (const scenarioId of ["C0", ...roomIds]) {
     const anns = annotationsFor(scenarioId);
     for (const a of anns) {
       const rowValues = [scenarioId, fmtClock(a.timeSec), "", a.type === "flag" ? "Flag" : "Comment", a.text];
@@ -364,15 +406,5 @@ function main(
       }
     }
   }
-  // No explicit save call needed — Office Scripts commits all changes
-  // to the workbook automatically when the script finishes running.
+  // Office Scripts commits all changes when the script finishes.
 }
-
-/*
- * `episodeNumber` is now saved in the participant payload by app.js (fixed
- * — previously only `episode_id` was saved, so Episode Detail's "Episode #"
- * column showed a raw episode_id instead of a clean number). Records saved
- * BEFORE that app.js fix won't have `episodeNumber` in their payload, so
- * this script falls back to showing episode_id for those older rows —
- * nothing breaks, it just reverts to the old display for pre-fix data.
- */
