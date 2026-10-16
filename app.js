@@ -1577,6 +1577,7 @@ async function saveActiveForm(){
       sessionId: ingested.sessionId, scenarioId, episodeId, kind,
       roomLabel: (ingested.scenarios[scenarioId] || {}).roomLabel || null,
       episodeNumber: form.episodeNumber != null ? form.episodeNumber : null,
+      disposition: form.disposition || null,
       scores: form.values, notes: form.notes,
       p0Pct: scores.p0Pct, p1Pct: scores.p1Pct, overall: scores.overall,
       scoreVersion: SCORE_VERSION,
@@ -1683,6 +1684,7 @@ async function seedAllForms(){
       const epDocId = `${ingested.sessionId}__${scenarioId}__ep__${ep.episodeId}`;
       const form = await ensureFormLoaded(epDocId, ITEMS_PARTICIPANT, 'participant', scenarioId, ep.episodeId, computeParticipantAutos(scenarioId, ep));
       form.episodeNumber = ep.episodeNumber != null ? ep.episodeNumber : null;
+      form.disposition = ep.disposition || null; // Hydra keep/exclude, so the scorecard can skip excluded attempts
     }
   }
 }
